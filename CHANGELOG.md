@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.5.0 — Nested/cushion treemap layout (2026-09-21)
+
+- **The treemap now subdivides recursively (`buildNestedTiles()`) instead of
+  showing one level per click.** Investigated why real drives with deep
+  category hierarchies (e.g. `My Big Docs\My Music\iTunes\iTunes Media\Music`)
+  still looked like the pre-0.4.0 flat-category treemap on first load: those
+  intermediate folders are pure containers that own none of their bytes
+  directly, so they never crossed the 15% dominant-extension threshold added
+  in 0.4.0 and always fell back to category color, no matter how deep
+  `ReportDepth` went. Rather than raising `ReportDepth` (which doesn't touch
+  the top-level view at all - only shortens the click path to reach it) or
+  duplicating `buildFolderBreakdown()`'s single-level drill logic for the
+  treemap specifically, each child's rect is now recursively laid out with
+  its own children in the same render, so real file-type color shows through
+  container folders wherever real content exists, at whatever depth was
+  scanned - matching what "WinDirStat-style" implied but didn't fully
+  deliver in 0.4.0's one-level-at-a-time view.
+- A tile stops recursing - and falls back to today's click-to-zoom - once it
+  runs out of children, its rect is too small on screen to subdivide legibly
+  (`MIN_RECURSE_AREA`), or a hard per-render leaf budget is hit
+  (`MAX_TREEMAP_LEAVES`, guards against pathological fan-out on a real
+  multi-TB drive with tens of thousands of folders).
+- Validated with two synthetic fixtures served over a local HTTP server (not
+  `file://`, which the harness's browser tooling can't script) and checked in
+  the actual browser: a `My Big Docs\My Music\iTunes\iTunes Media\Music`
+  chain of pure containers correctly showed its `.mp3`-blue leaf on the very
+  first view with the exact full path on hover, and a folder too small to
+  auto-recurse (`MIN_RECURSE_AREA` cutoff, confirmed via direct calls to
+  `buildNestedTiles()` in the live page) still rendered as one tile, stayed
+  clickable, and zoomed into its own child correctly on click.
+
 ## 0.4.0 — WinDirStat-style treemap coloring (2026-09-21)
 
 - **Tiles now color by file type**, not just folder category: audio, video,

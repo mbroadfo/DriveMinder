@@ -103,6 +103,15 @@ of misleadingly showing as a document folder. Pure container folders (most
 things near the top of a drive) show category color; folders with real
 content directly in them show their file type.
 
+The treemap itself is a **nested/cushion layout** (`buildNestedTiles()` in
+the template), not a single level at a time: each folder's rect is
+recursively subdivided by its own children, so a folder several levels of
+pure containers deep (e.g. `My Big Docs\My Music\iTunes\iTunes Media\Music`)
+still shows its real file-type color on the very first view of the drive,
+without clicking down through every container in between. A tile only stops
+recursing - and stays click-to-zoom instead - once it runs out of children
+or its rect gets too small on screen to subdivide legibly.
+
 ### Cleanup opportunities (current heuristics)
 
 - Drives running low on free space
@@ -139,6 +148,8 @@ content directly in them show their file type.
 - [x] Extension/file-type-colored treemap tiles with cushion shading — v0.4.0
       (folder-level dominant-extension, not true file-level tiles - see
       "Categorization" above)
+- [x] Nested/cushion treemap layout (folders subdivided by their own
+      children on the same view, not one level per click) — v0.5.0
 - [ ] Click-to-highlight: click `.mp3` in the legend, every mp3-dominant
       tile lights up (needs the coloring above first, which now exists)
 - [ ] File-level treemap tiles (true WinDirStat parity - would need per-file

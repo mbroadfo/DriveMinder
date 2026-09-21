@@ -254,7 +254,12 @@ function buildFolderBreakdown(scan, totalBytes){
    already has every folder up to scan depth), then lays it out with the
    standard squarified-treemap algorithm (Bruls/Huizing/van Wijk) so tile
    aspect ratios stay readable instead of degenerating into thin slivers.
-   Clicking a tile with children re-renders the map scoped to it. */
+   Each child's own rect is then recursively subdivided by ITS children too
+   (buildNestedTiles), so real content shows through "container" folders
+   (e.g. My Music > iTunes) on the very first view instead of after several
+   clicks. A tile only stops recursing - and becomes clickable to zoom in
+   instead - once it runs out of children or its rect gets too small to
+   subdivide legibly. */
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -352,6 +357,31 @@ function squarify(items, x, y, w, h){
 const TREEMAP_STATE = {}; // letter -> {stack:[nodeObj,...], pathStack:[path|null,...]}
 const TM_VB_W = 1000, TM_VB_H = 520;
 
+/* Nested/cushion layout: recursively subdivides a child's own rect using
+   ITS children too (and so on), so a real WinDirStat view shows colored
+   file-type patches wherever content actually lives, without clicking down
+   through "container" folders (e.g. My Music > iTunes) that own none of
+   their bytes directly. A tile stops recursing - and becomes a single
+   drawn leaf, still clickable to zoom in - once it has no children, its
+   rect is too small to subdivide legibly, or the total leaf budget below
+   is hit (guards against pathological fan-out on a real multi-TB drive). */
+const MIN_RECURSE_AREA = 60; // viewBox units^2; ~1 unit wide at 100% CSS width
+const MAX_TREEMAP_LEAVES = 3000;
+function buildNestedTiles(node, x, y, w, h, out){
+  const items = (out.length < MAX_TREEMAP_LEAVES) ? childrenWithLeftover(node) : [];
+  if(!items.length){
+    out.push({item:node, x, y, w, h});
+    return;
+  }
+  squarify(items, x, y, w, h).forEach(r=>{
+    const it = r.item;
+    const canRecurse = !it.isExtra && !it.isLeftover && it.children && it.children.length
+      && (r.w*r.h) >= MIN_RECURSE_AREA && out.length < MAX_TREEMAP_LEAVES;
+    if(canRecurse) buildNestedTiles(it, r.x, r.y, r.w, r.h, out);
+    else out.push({item:it, x:r.x, y:r.y, w:r.w, h:r.h});
+  });
+}
+
 /* A live poll rebuilds the whole tree from scratch each time (fresh JSON in,
    fresh node objects out) - the OLD stack's object references point at a
    now-discarded tree, so drilling into a folder would otherwise snap back to
@@ -408,7 +438,8 @@ function renderTreemap(letter, node, svgId, crumbId, infoId){
   }
 
   const pad = 1;
-  const rects = squarify(items, pad, pad, TM_VB_W-pad*2, TM_VB_H-pad*2);
+  const rects = [];
+  buildNestedTiles(node, pad, pad, TM_VB_W-pad*2, TM_VB_H-pad*2, rects);
   const glossId = 'tmGloss-'+letter;
 
   /* Tile color: dominant file type when this folder has direct files of its
@@ -429,7 +460,10 @@ function renderTreemap(letter, node, svgId, crumbId, infoId){
   const svgParts = rects.map((r,idx)=>{
     const it = r.item;
     const fam = tileFamily(it);
-    const rw = Math.max(r.w-0.8,0), rh = Math.max(r.h-0.8,0);
+    // Fixed 0.8-unit gap would swallow the smaller leaves nested recursion
+    // can now produce, so it scales down with tile size instead.
+    const gap = Math.min(0.8, r.w*0.12, r.h*0.12);
+    const rw = Math.max(r.w-gap,0), rh = Math.max(r.h-gap,0);
     const showLabel = rw>55 && rh>22;
     const drillable = (it.children && it.children.length) ? true : false;
     return `
@@ -686,7 +720,7 @@ function renderAll(payload){
     panel.innerHTML = `
       <div class="panel-box tm-box">
         <div class="tm-head">
-          <h4 style="margin:0;">Treemap — click a folder to drill in${scanning?' <span style="color:var(--text-faint);font-weight:400;">(filling in live…)</span>':''}</h4>
+          <h4 style="margin:0;">Treemap — click a tile to zoom in${scanning?' <span style="color:var(--text-faint);font-weight:400;">(filling in live…)</span>':''}</h4>
           <div class="tm-crumbs" id="tmCrumbs-${d.letter}"></div>
         </div>
         <div class="tm-svg-wrap" id="tmSvg-${d.letter}"></div>
