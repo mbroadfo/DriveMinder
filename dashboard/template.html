@@ -119,6 +119,7 @@ footer{color:var(--text-faint); font-size:12px; border-top:1px solid var(--borde
 .tm-svg-wrap svg{width:100%; height:auto; display:block; background:var(--surface-2); border-radius:8px;}
 .tm-info{margin-top:10px; font-size:12.8px; color:var(--text-dim); min-height:18px; overflow-wrap:anywhere;}
 .tm-info b{color:var(--text);}
+.tm-ext-legend{margin-top:10px; padding-top:10px; border-top:1px dashed var(--border);}
 </style>
 
 <div class="wrap">
@@ -180,6 +181,31 @@ const CATS = {
   other:{label:'Other / not itemized', color:'var(--cat-other)'},
 };
 
+/* File-type palette for the treemap - WinDirStat colors by extension, which
+   reads much better than our 8-way category scheme at a glance (a folder
+   full of .mp3 vs .jpg vs .zip actually looks different). Grouped into
+   families rather than one color per extension so the legend stays short
+   and the mapping is guessable rather than arbitrary. */
+const EXT_FAMILIES = [
+  {key:'audio',   label:'Audio',           color:'#3f7cac', test:/^\.(mp3|m4a|m4b|m4p|flac|wav|aac|wma|ogg|aa|aax|mid|midi)$/},
+  {key:'video',   label:'Video',           color:'#c0453a', test:/^\.(mp4|mov|avi|mkv|wmv|m4v|mpg|mpeg|insv|lrv|vob|3gp|flv|webm)$/},
+  {key:'image',   label:'Images',          color:'#3fa7ac', test:/^\.(jpg|jpeg|png|heic|raw|cr2|nef|dng|tiff?|bmp|gif|webp|psd)$/},
+  {key:'doc',     label:'Documents',       color:'#4f9d69', test:/^\.(pdf|docx?|xlsx?|pptx?|txt|rtf|odt|csv|md)$/},
+  {key:'archive', label:'Archives/images', color:'#8a6bc9', test:/^\.(zip|rar|7z|tar|gz|tgz|iso|vhd|vhdx|vmdk)$/},
+  {key:'program', label:'Programs/system', color:'#d9a441', test:/^\.(exe|msi|dll|sys|bat|cmd|ps1|msp)$/},
+  {key:'game',    label:'Game/app data',   color:'#c95fa0', test:/^\.(pak|vpk|gcf|dds|blp|wem|sav|mca|dat|gro|bsp)$/},
+  {key:'data',    label:'App data/logs',   color:'#8b96a3', test:/^\.(db|log|ini|xml|json|cache|qdf-backup|qdf|qel)$/},
+];
+const EXT_OTHER = {key:'other', label:'Other', color:'#6b7684'};
+const extColorCache = new Map();
+function extFamily(ext){
+  if(!ext) return EXT_OTHER;
+  if(extColorCache.has(ext)) return extColorCache.get(ext);
+  const found = EXT_FAMILIES.find(f => f.test.test(ext)) || EXT_OTHER;
+  extColorCache.set(ext, found);
+  return found;
+}
+
 function categorizeFolderName(name){
   const n = (name||'').toLowerCase();
   if(/^\$windows\.~(ws|bt)$|^windows\.old$|^\$recycle\.bin$|^recycler$|^system volume information$|^temp$|cache/.test(n)) return 'cache';
@@ -228,7 +254,12 @@ function buildFolderBreakdown(scan, totalBytes){
    already has every folder up to scan depth), then lays it out with the
    standard squarified-treemap algorithm (Bruls/Huizing/van Wijk) so tile
    aspect ratios stay readable instead of degenerating into thin slivers.
-   Clicking a tile with children re-renders the map scoped to it. */
+   Each child's own rect is then recursively subdivided by ITS children too
+   (buildNestedTiles), so real content shows through "container" folders
+   (e.g. My Music > iTunes) on the very first view instead of after several
+   clicks. A tile only stops recursing - and becomes clickable to zoom in
+   instead - once it runs out of children or its rect gets too small to
+   subdivide legibly. */
 function escapeHtml(s){
   return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
@@ -242,7 +273,7 @@ function buildTree(scan){
   const nodes = new Map();
   let root = null;
   dirs.forEach(d=>{
-    const node = {path:d.Path, name:basename(d.Path)||d.Path, depth:d.Depth, bytes:d.Bytes, children:[]};
+    const node = {path:d.Path, name:basename(d.Path)||d.Path, depth:d.Depth, bytes:d.Bytes, dominantExt:d.DominantExt||null, dominantExtBytes:d.DominantExtBytes||0, children:[]};
     nodes.set(d.Path, node);
     if(d.Depth === 0) root = node;
   });
@@ -326,6 +357,31 @@ function squarify(items, x, y, w, h){
 const TREEMAP_STATE = {}; // letter -> {stack:[nodeObj,...], pathStack:[path|null,...]}
 const TM_VB_W = 1000, TM_VB_H = 520;
 
+/* Nested/cushion layout: recursively subdivides a child's own rect using
+   ITS children too (and so on), so a real WinDirStat view shows colored
+   file-type patches wherever content actually lives, without clicking down
+   through "container" folders (e.g. My Music > iTunes) that own none of
+   their bytes directly. A tile stops recursing - and becomes a single
+   drawn leaf, still clickable to zoom in - once it has no children, its
+   rect is too small to subdivide legibly, or the total leaf budget below
+   is hit (guards against pathological fan-out on a real multi-TB drive). */
+const MIN_RECURSE_AREA = 60; // viewBox units^2; ~1 unit wide at 100% CSS width
+const MAX_TREEMAP_LEAVES = 3000;
+function buildNestedTiles(node, x, y, w, h, out){
+  const items = (out.length < MAX_TREEMAP_LEAVES) ? childrenWithLeftover(node) : [];
+  if(!items.length){
+    out.push({item:node, x, y, w, h});
+    return;
+  }
+  squarify(items, x, y, w, h).forEach(r=>{
+    const it = r.item;
+    const canRecurse = !it.isExtra && !it.isLeftover && it.children && it.children.length
+      && (r.w*r.h) >= MIN_RECURSE_AREA && out.length < MAX_TREEMAP_LEAVES;
+    if(canRecurse) buildNestedTiles(it, r.x, r.y, r.w, r.h, out);
+    else out.push({item:it, x:r.x, y:r.y, w:r.w, h:r.h});
+  });
+}
+
 /* A live poll rebuilds the whole tree from scratch each time (fresh JSON in,
    fresh node objects out) - the OLD stack's object references point at a
    now-discarded tree, so drilling into a folder would otherwise snap back to
@@ -381,25 +437,56 @@ function renderTreemap(letter, node, svgId, crumbId, infoId){
     return;
   }
 
-  const pad = 2;
-  const rects = squarify(items, pad, pad, TM_VB_W-pad*2, TM_VB_H-pad*2);
+  const pad = 1;
+  const rects = [];
+  buildNestedTiles(node, pad, pad, TM_VB_W-pad*2, TM_VB_H-pad*2, rects);
+  const glossId = 'tmGloss-'+letter;
+
+  /* Tile color: dominant file type when this folder has direct files of its
+     own (WinDirStat-style - most of the visual "read" comes from this),
+     falling back to the folder-name category for pure container folders
+     (e.g. "Users", "Program Files") that own no files directly. */
+  function tileFamily(it){
+    if(it.isLeftover || it.isExtra) return EXT_OTHER;
+    // Trust the dominant extension only when it's a real chunk of this
+    // folder, not a stray metadata file amid mostly-subfolder content (e.g.
+    // "My Music" showing as Documents because of one lone .xls sitting
+    // directly in it while the actual music lives in subfolders below).
+    if(it.dominantExt && it.dominantExtBytes > it.bytes * 0.15) return extFamily(it.dominantExt);
+    const cat = categorizeFolderName(it.name);
+    return {label: CATS[cat].label, color: CATS[cat].color}; // CATS colors are var(--token) refs, valid directly as an SVG fill
+  }
 
   const svgParts = rects.map((r,idx)=>{
     const it = r.item;
-    const cat = (it.isLeftover || it.isExtra) ? 'other' : categorizeFolderName(it.name);
-    const color = CATS[cat] ? CATS[cat].color : 'var(--cat-other)';
-    const rw = Math.max(r.w-1.4,0), rh = Math.max(r.h-1.4,0);
+    const fam = tileFamily(it);
+    // Fixed 0.8-unit gap would swallow the smaller leaves nested recursion
+    // can now produce, so it scales down with tile size instead.
+    const gap = Math.min(0.8, r.w*0.12, r.h*0.12);
+    const rw = Math.max(r.w-gap,0), rh = Math.max(r.h-gap,0);
     const showLabel = rw>55 && rh>22;
     const drillable = (it.children && it.children.length) ? true : false;
     return `
       <g class="tm-tile" data-idx="${idx}" style="cursor:${drillable?'pointer':'default'}">
-        <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${color}" fill-opacity="${it.isLeftover?0.4:0.88}" stroke="var(--surface)" stroke-width="1.4" rx="2"></rect>
-        ${showLabel ? `<text x="${(r.x+5).toFixed(1)}" y="${(r.y+15).toFixed(1)}" font-size="11" fill="#fff" style="pointer-events:none;font-family:'Source Sans 3',sans-serif;font-weight:600;">${escapeHtml(truncateLabel(it.name, rw))}</text><text x="${(r.x+5).toFixed(1)}" y="${(r.y+28).toFixed(1)}" font-size="10" fill="#fff" fill-opacity="0.85" style="pointer-events:none;font-family:'IBM Plex Mono',monospace;">${fmt(it.bytes)}</text>` : ''}
-        <title>${escapeHtml(it.name)} — ${fmt(it.bytes)} (${pct(it.bytes,node.bytes).toFixed(1)}% of ${escapeHtml(node.name||letter+':')})</title>
+        <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${fam.color}" fill-opacity="${it.isLeftover?0.45:1}"></rect>
+        <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="url(#${glossId})" stroke="rgba(0,0,0,.35)" stroke-width="0.6"></rect>
+        ${showLabel ? `<text x="${(r.x+5).toFixed(1)}" y="${(r.y+15).toFixed(1)}" font-size="11" fill="#fff" stroke="rgba(0,0,0,.55)" stroke-width="2.5" paint-order="stroke" style="pointer-events:none;font-family:'Source Sans 3',sans-serif;font-weight:600;">${escapeHtml(truncateLabel(it.name, rw))}</text><text x="${(r.x+5).toFixed(1)}" y="${(r.y+28).toFixed(1)}" font-size="10" fill="#fff" stroke="rgba(0,0,0,.55)" stroke-width="2.5" paint-order="stroke" fill-opacity="0.92" style="pointer-events:none;font-family:'IBM Plex Mono',monospace;">${fmt(it.bytes)}</text>` : ''}
+        <title>${escapeHtml(it.name)} — ${fmt(it.bytes)} (${pct(it.bytes,node.bytes).toFixed(1)}% of ${escapeHtml(node.name||letter+':')}) — ${escapeHtml(fam.label)}</title>
       </g>`;
   }).join('');
 
-  container.innerHTML = `<svg viewBox="0 0 ${TM_VB_W} ${TM_VB_H}">${svgParts}</svg>`;
+  container.innerHTML = `<svg viewBox="0 0 ${TM_VB_W} ${TM_VB_H}">
+    <defs>
+      <linearGradient id="${glossId}" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" stop-color="#ffffff" stop-opacity="0.5"/>
+        <stop offset="18%" stop-color="#ffffff" stop-opacity="0.16"/>
+        <stop offset="48%" stop-color="#ffffff" stop-opacity="0"/>
+        <stop offset="75%" stop-color="#000000" stop-opacity="0.08"/>
+        <stop offset="100%" stop-color="#000000" stop-opacity="0.32"/>
+      </linearGradient>
+    </defs>
+    ${svgParts}
+  </svg>`;
 
   container.querySelectorAll('.tm-tile').forEach((el, idx)=>{
     const it = rects[idx].item;
@@ -633,11 +720,14 @@ function renderAll(payload){
     panel.innerHTML = `
       <div class="panel-box tm-box">
         <div class="tm-head">
-          <h4 style="margin:0;">Treemap — click a folder to drill in${scanning?' <span style="color:var(--text-faint);font-weight:400;">(filling in live…)</span>':''}</h4>
+          <h4 style="margin:0;">Treemap — click a tile to zoom in${scanning?' <span style="color:var(--text-faint);font-weight:400;">(filling in live…)</span>':''}</h4>
           <div class="tm-crumbs" id="tmCrumbs-${d.letter}"></div>
         </div>
         <div class="tm-svg-wrap" id="tmSvg-${d.letter}"></div>
         <div class="tm-info" id="tmInfo-${d.letter}"></div>
+        <div class="legend tm-ext-legend">${EXT_FAMILIES.concat([EXT_OTHER]).map(f=>
+          `<span class="li"><span class="sw" style="background:${f.color}"></span>${f.label}</span>`
+        ).join('')}<span class="li" style="color:var(--text-faint);">+ container folders shown by category color</span></div>
       </div>
       <div class="detail-grid">
         <div class="panel-box">

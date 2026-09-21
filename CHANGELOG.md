@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.5.0 — Nested/cushion treemap layout (2026-09-21)
+
+- **The treemap now subdivides recursively (`buildNestedTiles()`) instead of
+  showing one level per click.** Investigated why real drives with deep
+  category hierarchies (e.g. `My Big Docs\My Music\iTunes\iTunes Media\Music`)
+  still looked like the pre-0.4.0 flat-category treemap on first load: those
+  intermediate folders are pure containers that own none of their bytes
+  directly, so they never crossed the 15% dominant-extension threshold added
+  in 0.4.0 and always fell back to category color, no matter how deep
+  `ReportDepth` went. Rather than raising `ReportDepth` (which doesn't touch
+  the top-level view at all - only shortens the click path to reach it) or
+  duplicating `buildFolderBreakdown()`'s single-level drill logic for the
+  treemap specifically, each child's rect is now recursively laid out with
+  its own children in the same render, so real file-type color shows through
+  container folders wherever real content exists, at whatever depth was
+  scanned - matching what "WinDirStat-style" implied but didn't fully
+  deliver in 0.4.0's one-level-at-a-time view.
+- A tile stops recursing - and falls back to today's click-to-zoom - once it
+  runs out of children, its rect is too small on screen to subdivide legibly
+  (`MIN_RECURSE_AREA`), or a hard per-render leaf budget is hit
+  (`MAX_TREEMAP_LEAVES`, guards against pathological fan-out on a real
+  multi-TB drive with tens of thousands of folders).
+- Validated with two synthetic fixtures served over a local HTTP server (not
+  `file://`, which the harness's browser tooling can't script) and checked in
+  the actual browser: a `My Big Docs\My Music\iTunes\iTunes Media\Music`
+  chain of pure containers correctly showed its `.mp3`-blue leaf on the very
+  first view with the exact full path on hover, and a folder too small to
+  auto-recurse (`MIN_RECURSE_AREA` cutoff, confirmed via direct calls to
+  `buildNestedTiles()` in the live page) still rendered as one tile, stayed
+  clickable, and zoomed into its own child correctly on click.
+
+## 0.4.0 — WinDirStat-style treemap coloring (2026-09-21)
+
+- **Tiles now color by file type**, not just folder category: audio, video,
+  images, documents, archives, programs, game data, app data/logs (see
+  `EXT_FAMILIES` in `dashboard/template.html`). `Scan-Drive.ps1` tracks,
+  per reported folder, the extension that accounts for the most bytes among
+  files directly in that folder (not descendants) - depth-gated to only
+  folders that actually get reported, after measuring that tracking it
+  unconditionally cost real time on deeply-nested drives for data that was
+  then thrown away unused.
+- **Cushion shading**: each tile gets a shared diagonal gradient overlay
+  (light top-left, dark bottom-right) instead of a flat fill, plus tighter
+  gaps and sharp corners instead of rounded ones - closer to WinDirStat's
+  dense, glossy mosaic look. Labels get a dark outline so they stay legible
+  against any tile color.
+- **Real data-quality bug found and fixed during validation**: the first
+  version trusted a folder's dominant extension unconditionally, which
+  meant folders that are almost entirely subfolders - "My Music" with 346GB
+  of subfolders and one stray 4KB `.xls` sitting directly in it - showed up
+  colored as Documents instead of Audio, because that stray file was
+  technically the "only" thing directly inside it. Caught by pulling real
+  scan data and checking dominant-extension folders by hand, not by
+  reasoning about the code. Fixed by sending `DominantExtBytes` alongside
+  `DominantExt` and only trusting it client-side when it's over 15% of the
+  folder's total size; verified on real D: and E: data that container
+  folders now correctly show 0% (fall back to category) while real content
+  folders (GoPro clip folders, iTunes movie folders) show 95-100%.
+- **Second performance regression found and fixed during validation**: the
+  first working version of per-folder extension tracking added ~20s to a
+  real D: scan even beyond the live-tree cost, because it tracked every
+  file's extension for every folder regardless of scan depth - including
+  files many levels past `ReportDepth` whose data was never reported and
+  therefore never used (D:'s iTunes Album Artwork cache alone nests 9+
+  levels deep). Fixed by gating the tracking to `Depth <= ReportDepth`,
+  which recovered essentially all of the added time.
+
 ## 0.3.0 — Live browser view while scanning (2026-09-21)
 
 - **Live scanning view**: `Invoke-DriveCensus.ps1` now starts a small local
