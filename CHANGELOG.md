@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.4.0 — WinDirStat-style treemap coloring (2026-09-21)
+
+- **Tiles now color by file type**, not just folder category: audio, video,
+  images, documents, archives, programs, game data, app data/logs (see
+  `EXT_FAMILIES` in `dashboard/template.html`). `Scan-Drive.ps1` tracks,
+  per reported folder, the extension that accounts for the most bytes among
+  files directly in that folder (not descendants) - depth-gated to only
+  folders that actually get reported, after measuring that tracking it
+  unconditionally cost real time on deeply-nested drives for data that was
+  then thrown away unused.
+- **Cushion shading**: each tile gets a shared diagonal gradient overlay
+  (light top-left, dark bottom-right) instead of a flat fill, plus tighter
+  gaps and sharp corners instead of rounded ones - closer to WinDirStat's
+  dense, glossy mosaic look. Labels get a dark outline so they stay legible
+  against any tile color.
+- **Real data-quality bug found and fixed during validation**: the first
+  version trusted a folder's dominant extension unconditionally, which
+  meant folders that are almost entirely subfolders - "My Music" with 346GB
+  of subfolders and one stray 4KB `.xls` sitting directly in it - showed up
+  colored as Documents instead of Audio, because that stray file was
+  technically the "only" thing directly inside it. Caught by pulling real
+  scan data and checking dominant-extension folders by hand, not by
+  reasoning about the code. Fixed by sending `DominantExtBytes` alongside
+  `DominantExt` and only trusting it client-side when it's over 15% of the
+  folder's total size; verified on real D: and E: data that container
+  folders now correctly show 0% (fall back to category) while real content
+  folders (GoPro clip folders, iTunes movie folders) show 95-100%.
+- **Second performance regression found and fixed during validation**: the
+  first working version of per-folder extension tracking added ~20s to a
+  real D: scan even beyond the live-tree cost, because it tracked every
+  file's extension for every folder regardless of scan depth - including
+  files many levels past `ReportDepth` whose data was never reported and
+  therefore never used (D:'s iTunes Album Artwork cache alone nests 9+
+  levels deep). Fixed by gating the tracking to `Depth <= ReportDepth`,
+  which recovered essentially all of the added time.
+
 ## 0.3.0 — Live browser view while scanning (2026-09-21)
 
 - **Live scanning view**: `Invoke-DriveCensus.ps1` now starts a small local

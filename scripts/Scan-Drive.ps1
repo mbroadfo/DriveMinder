@@ -136,6 +136,16 @@ function Scan-Dir {
         $pathStack.Add($displayPath)
         $liveDepths[$displayPath] = $Depth
     }
+    # Extension breakdown of files DIRECTLY in this folder (not descendants -
+    # a local hashtable, not the global ancestor-walk that turned out to be
+    # expensive earlier). Lets the treemap color a folder tile by its
+    # dominant file type, WinDirStat-style, instead of only by category.
+    # Only tracked for folders that will actually be reported (depth <=
+    # ReportDepth) - measured real time wasted computing this for folders
+    # buried deeper than that (e.g. iTunes's Album Artwork cache, 9+ levels
+    # deep on a real drive) that get thrown away unused.
+    $trackOwnExt = $Depth -le $ReportDepth
+    $ownExtBytes = @{}
 
     try {
         $dirInfo = New-Object System.IO.DirectoryInfo($longPath)
@@ -166,6 +176,10 @@ function Scan-Dir {
                     if (-not $extTotals.ContainsKey($ext)) { $extTotals[$ext] = @{Count=0; Bytes=[int64]0} }
                     $extTotals[$ext].Count++
                     $extTotals[$ext].Bytes += $sz
+                    if ($trackOwnExt) {
+                        if (-not $ownExtBytes.ContainsKey($ext)) { $ownExtBytes[$ext] = [int64]0 }
+                        $ownExtBytes[$ext] += $sz
+                    }
 
                     if ($topFiles.Count -lt $TopFilesCount) {
                         $topFiles.Add([pscustomobject]@{Path=(ConvertFrom-LongPath $entry.FullName); Bytes=$sz; LastWrite=$entry.LastWriteTime.ToString('o')})
@@ -185,7 +199,19 @@ function Scan-Dir {
         }
 
         if ($Depth -le $ReportDepth) {
-            $dirReport.Add([pscustomobject]@{Path=$displayPath; Depth=$Depth; Bytes=$totalBytes}) | Out-Null
+            $domExt = $null
+            $domExtBytes = [int64]0
+            if ($ownExtBytes.Count -gt 0) {
+                $top = $ownExtBytes.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 1
+                $domExt = $top.Key
+                $domExtBytes = $top.Value
+            }
+            # DominantExtBytes lets the client decide whether this extension
+            # is actually representative of the folder (e.g. a folder that's
+            # 99% subfolders with one stray .ini file directly in it) or just
+            # noise - it only means something as a fraction of Bytes (the
+            # folder's full subtree total), which the client already has.
+            $dirReport.Add([pscustomobject]@{Path=$displayPath; Depth=$Depth; Bytes=$totalBytes; DominantExt=$domExt; DominantExtBytes=$domExtBytes}) | Out-Null
         }
 
         return $totalBytes

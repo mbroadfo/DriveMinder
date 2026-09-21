@@ -91,6 +91,18 @@ Large or ambiguous top-level folders (e.g. `Users\<name>`) are automatically
 drilled into one level deeper rather than left as one big blob — see
 `buildFolderBreakdown()` in the template.
 
+The **treemap** colors tiles differently: by dominant file type (audio,
+video, images, documents, archives, programs, game data, app data/logs -
+see `EXT_FAMILIES` in the template), matching how WinDirStat reads at a
+glance. `Scan-Drive.ps1` tracks, for every reported folder, which extension
+accounts for the most bytes among files directly in it (not descendants) -
+the treemap only trusts that when it's a real chunk of the folder (over 15%
+of its total size), so a "My Music" folder that's 99% subfolders with one
+stray `.ini` sitting directly in it falls back to the category color instead
+of misleadingly showing as a document folder. Pure container folders (most
+things near the top of a drive) show category color; folders with real
+content directly in them show their file type.
+
 ### Cleanup opportunities (current heuristics)
 
 - Drives running low on free space
@@ -124,9 +136,14 @@ drilled into one level deeper rather than left as one big blob — see
 - [x] Treemap visualization with click-to-drill — v0.2.0
 - [x] Live console progress while scanning (files/bytes/current folder) — v0.2.0
 - [x] Live browser view (same treemap, filling in while scanning runs) — v0.3.0
-- [ ] Extension-colored treemap tiles with legend-linked highlighting
-      (the WinDirStat-style "click `.mp3` in the legend, every mp3 block
-      lights up" interaction — needs file-level, not folder-level, tiles)
+- [x] Extension/file-type-colored treemap tiles with cushion shading — v0.4.0
+      (folder-level dominant-extension, not true file-level tiles - see
+      "Categorization" above)
+- [ ] Click-to-highlight: click `.mp3` in the legend, every mp3-dominant
+      tile lights up (needs the coloring above first, which now exists)
+- [ ] File-level treemap tiles (true WinDirStat parity - would need per-file
+      data sent to the client, which today's design deliberately avoids for
+      report-size/scan-speed reasons)
 - [ ] Real duplicate-file detection (content hashing, not just name+size)
 - [ ] Backup retention strategy — suggest what to keep/prune across
       generations of backups (e.g. the Quicken `.qdf-backup` pattern, nested
