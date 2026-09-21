@@ -1,0 +1,9 @@
+# Scan output contains real personal file paths - never commit it
+output/
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.vs/
+.vscode/
+*.user
