@@ -44,20 +44,142 @@ if (-not $DriveLetters) {
 
 if (-not $DriveLetters) { throw "No fixed or removable drives found to scan." }
 
+function Get-FreeLocalPort {
+    param([int]$Start = 8787, [int]$MaxTries = 30)
+    for ($p = $Start; $p -lt ($Start + $MaxTries); $p++) {
+        try {
+            $probe = New-Object System.Net.HttpListener
+            $probe.Prefixes.Add("http://127.0.0.1:$p/")
+            $probe.Start()
+            $probe.Stop()
+            return $p
+        } catch { continue }
+    }
+    return $null
+}
+
 Write-Host "DriveMinder: scanning $($DriveLetters -join ', ')..." -ForegroundColor Cyan
 
 $timestamp = Get-Date -Format 'yyyy-MM-dd_HHmmss'
 $runDir = Join-Path $OutputDir $timestamp
 New-Item -ItemType Directory -Force -Path $runDir | Out-Null
 
+# The rich per-folder live tree (needed for the browser's live treemap) has
+# a real cost - measured ~40% slower on a real 887GB drive than plain
+# scalar progress - so only pay it when something will actually be watching.
+# -NoOpen means nobody will.
+$wantLiveView = -not $NoOpen
+
 $progressFiles = @{}
+# Not `$x = if (...) { @(...) } else { @() }` - PowerShell unrolls a
+# single-element array returned from an if/else expression down to its bare
+# scalar element when it's captured by assignment (a classic, easy-to-miss
+# gotcha). That turned '-LiveTree' into a plain string here, which silently
+# broke `@extraArgs` splatting below and crashed every scan job instantly
+# (caught by running with diagnostic logging: extraArgs came through typed
+# as System.String, not an array). Building the array via a plain += avoids
+# the unrolling entirely.
+$liveTreeArgs = @()
+if ($wantLiveView) { $liveTreeArgs += '-LiveTree' }
+
 $jobs = foreach ($d in $DriveLetters) {
     $outJson = Join-Path $runDir "scan_$d.json"
     $progJson = Join-Path $runDir "progress_$d.json"
     $progressFiles[$d] = $progJson
-    Start-Job -Name "scan_$d" -ArgumentList $scanScript, $d, $outJson, $progJson -ScriptBlock {
-        param($script, $letter, $out, $prog)
-        & powershell -NoProfile -ExecutionPolicy Bypass -File $script -DriveRoot "$letter`:\" -OutJson $out -ProgressJson $prog
+    Start-Job -Name "scan_$d" -ArgumentList $scanScript, $d, $outJson, $progJson, $liveTreeArgs -ScriptBlock {
+        param($script, $letter, $out, $prog, $extraArgs)
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $script -DriveRoot "$letter`:\" -OutJson $out -ProgressJson $prog @extraArgs
+    }
+}
+
+# ---- live browser view: same dashboard page, fed by a poll endpoint instead
+# of a one-time static payload, so it can be watched while scanning runs ----
+$liveJob = $null
+$livePort = $null
+if ($wantLiveView) {
+    $livePort = Get-FreeLocalPort
+    if ($livePort) {
+        $liveJob = Start-Job -Name 'liveserver' -ArgumentList $livePort, $runDir, $DriveLetters, $templatePath -ScriptBlock {
+            param($port, $runDir, $driveLetters, $templatePath)
+
+            $listener = New-Object System.Net.HttpListener
+            $listener.Prefixes.Add("http://127.0.0.1:$port/")
+            $listener.Start()
+            # Serve the template with its sample-data placeholder untouched -
+            # the page's own JS treats an empty drives[] as "poll /live-data"
+            # instead of "render this once and stop", so this exact same file
+            # doubles as both the live view and (once statically re-rendered
+            # by the parent script at the end) the final report.
+            $templateText = Get-Content $templatePath -Raw
+
+            function Get-LiveDrives {
+                $result = @()
+                foreach ($d in $driveLetters) {
+                    $outJson = Join-Path $runDir "scan_$d.json"
+                    $progJson = Join-Path $runDir "progress_$d.json"
+                    $vol = Get-Volume -DriveLetter $d -ErrorAction SilentlyContinue | Select-Object -First 1
+                    $scanObj = $null
+                    if (Test-Path $outJson) {
+                        try { $scanObj = Get-Content $outJson -Raw | ConvertFrom-Json } catch {}
+                        if ($scanObj) { $scanObj | Add-Member -NotePropertyName Done -NotePropertyValue $true -Force }
+                    }
+                    if (-not $scanObj -and (Test-Path $progJson)) {
+                        try {
+                            $p = Get-Content $progJson -Raw | ConvertFrom-Json
+                            $scanObj = [pscustomobject]@{
+                                DriveRoot     = $p.DriveRoot
+                                TotalBytes    = $p.BytesScanned
+                                Directories   = @($p.Directories)
+                                TopExtensions = @()
+                                TopFiles      = @()
+                                SkippedCount  = 0
+                                SkippedSample = @()
+                                ElapsedSec    = $p.ElapsedSec
+                                Done          = $false
+                            }
+                        } catch {}
+                    }
+                    if ($scanObj) {
+                        $result += [pscustomobject]@{
+                            letter     = $d
+                            label      = if ($vol) { $vol.FileSystemLabel } else { '' }
+                            totalBytes = if ($vol) { [int64]$vol.Size } else { $null }
+                            freeBytes  = if ($vol) { [int64]$vol.SizeRemaining } else { $null }
+                            scan       = $scanObj
+                        }
+                    }
+                }
+                return $result
+            }
+
+            while ($listener.IsListening) {
+                try { $ctx = $listener.GetContext() } catch { break }
+                $req = $ctx.Request
+                $res = $ctx.Response
+                try {
+                    if ($req.Url.AbsolutePath -eq '/live-data') {
+                        $payload = [pscustomobject]@{ generatedAt = (Get-Date).ToString('o'); machine = $env:COMPUTERNAME; drives = @(Get-LiveDrives) }
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress))
+                        $res.ContentType = 'application/json'
+                        $res.ContentLength64 = $bytes.Length
+                        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    } else {
+                        $bytes = [System.Text.Encoding]::UTF8.GetBytes($templateText)
+                        $res.ContentType = 'text/html; charset=utf-8'
+                        $res.ContentLength64 = $bytes.Length
+                        $res.OutputStream.Write($bytes, 0, $bytes.Length)
+                    }
+                } catch {
+                } finally {
+                    $res.OutputStream.Close()
+                }
+            }
+        }
+        Start-Sleep -Milliseconds 300
+        Write-Host "Live scan view: http://127.0.0.1:$livePort/" -ForegroundColor Cyan
+        Start-Process "http://127.0.0.1:$livePort/"
+    } else {
+        Write-Warning "Could not find a free local port for the live scan view - continuing without it."
     }
 }
 
@@ -138,6 +260,13 @@ $reportPath = Join-Path $runDir 'DriveMinder-Report.html'
 
 Write-Host "Report written to: $reportPath" -ForegroundColor Green
 
-if (-not $NoOpen) {
+if ($liveJob) {
+    # The already-open browser tab keeps whatever it last polled (which, by
+    # now, is the complete final data - same shape either way) even after
+    # this stops responding; it just can't be refreshed anymore. That's why
+    # the static file below still gets written regardless.
+    Stop-Job -Job $liveJob -ErrorAction SilentlyContinue
+    Remove-Job -Job $liveJob -Force -ErrorAction SilentlyContinue
+} elseif (-not $NoOpen) {
     Start-Process $reportPath
 }
