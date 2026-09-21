@@ -108,6 +108,16 @@ table td.s{font-family:'IBM Plex Mono'; white-space:nowrap; text-align:right;}
 .note{font-size:12.5px; color:var(--text-faint); border-top:1px dashed var(--border); padding-top:12px; margin-top:14px;}
 footer{color:var(--text-faint); font-size:12px; border-top:1px solid var(--border); padding-top:18px;}
 .empty{color:var(--text-faint); font-size:13px; font-style:italic;}
+.tm-box{margin-bottom:20px;}
+.tm-head{display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px; margin-bottom:10px;}
+.tm-crumbs{display:flex; align-items:center; flex-wrap:wrap; gap:0; font-family:'IBM Plex Mono'; font-size:12px;}
+.tm-crumb{background:none; border:none; color:var(--accent); cursor:pointer; padding:3px 5px; border-radius:4px; font-family:inherit; font-size:inherit;}
+.tm-crumb:hover{background:var(--surface-2);}
+.tm-crumb:last-child{color:var(--text); font-weight:600; cursor:default;}
+.tm-sep{color:var(--text-faint); padding:0 2px;}
+.tm-svg-wrap svg{width:100%; height:auto; display:block; background:var(--surface-2); border-radius:8px;}
+.tm-info{margin-top:10px; font-size:12.8px; color:var(--text-dim); min-height:18px; overflow-wrap:anywhere;}
+.tm-info b{color:var(--text);}
 </style>
 
 <div class="wrap">
@@ -145,7 +155,7 @@ footer{color:var(--text-faint); font-size:12px; border-top:1px solid var(--borde
    retention strategy, investigation, chat) can build on this
    one client-side layer without touching the PowerShell scanner.
    ============================================================ */
-const PAYLOAD = /*__DRIVEMINDER_DATA__*/{"generatedAt":null,"machine":"(sample)","drives":[]};
+const PAYLOAD = /*__DRIVEMINDER_DATA_START__*/{"generatedAt":null,"machine":"(sample)","drives":[]}/*__DRIVEMINDER_DATA_END__*/;
 
 const GiB = 1073741824;
 function fmt(bytes){
@@ -210,6 +220,171 @@ function buildFolderBreakdown(scan, totalBytes){
 
   dirs.filter(d => d.Depth === 1).forEach(t => walk(t, ''));
   return results.sort((a,b)=>b.bytes-a.bytes);
+}
+
+/* ---------------- treemap: hierarchy + squarified layout + drill-down ----------------
+   Builds a real parent/child tree from the flat Directories[] list (which
+   already has every folder up to scan depth), then lays it out with the
+   standard squarified-treemap algorithm (Bruls/Huizing/van Wijk) so tile
+   aspect ratios stay readable instead of degenerating into thin slivers.
+   Clicking a tile with children re-renders the map scoped to it. */
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function truncateLabel(name, widthUnits){
+  const maxChars = Math.max(Math.floor(widthUnits/6.2), 3);
+  return name.length > maxChars ? name.slice(0, maxChars-1)+'…' : name;
+}
+
+function buildTree(scan){
+  const dirs = scan.Directories || [];
+  const nodes = new Map();
+  let root = null;
+  dirs.forEach(d=>{
+    const node = {path:d.Path, name:basename(d.Path)||d.Path, depth:d.Depth, bytes:d.Bytes, children:[]};
+    nodes.set(d.Path, node);
+    if(d.Depth === 0) root = node;
+  });
+  dirs.forEach(d=>{
+    if(d.Depth === 0) return;
+    const node = nodes.get(d.Path);
+    const parentPath = d.Depth === 1 ? (root ? root.path : null) : d.Path.substring(0, d.Path.lastIndexOf('\\'));
+    const parent = parentPath != null ? nodes.get(parentPath) : null;
+    if(parent) parent.children.push(node);
+  });
+  return root;
+}
+
+/* Returns the tiles to draw for one treemap level: real child folders
+   (capped, with overflow folded into a "+N more" drillable bucket) plus a
+   synthetic tile for bytes that belong to this folder but aren't in any
+   scanned subfolder (loose files, or content past the scan depth limit). */
+function childrenWithLeftover(node, maxTiles){
+  maxTiles = maxTiles || 40;
+  const kids = (node.children||[]).slice().sort((a,b)=>b.bytes-a.bytes);
+  const childSum = kids.reduce((s,k)=>s+k.bytes,0);
+  const leftover = Math.max(node.bytes - childSum, 0);
+  let items = kids;
+  if(kids.length > maxTiles){
+    const visible = kids.slice(0, maxTiles-1);
+    const overflow = kids.slice(maxTiles-1);
+    const overflowSum = overflow.reduce((s,k)=>s+k.bytes,0);
+    items = visible.concat([{name:`+ ${overflow.length} more`, bytes:overflowSum, isExtra:true, children:overflow}]);
+  }
+  if(leftover > Math.max(node.bytes*0.003, 1)){
+    items = items.concat([{name:'(files here / beyond scan depth)', bytes:leftover, isLeftover:true, children:[]}]);
+  }
+  return items;
+}
+
+function worstAspectRatio(row, side){
+  const sum = row.reduce((s,r)=>s+r.value,0);
+  const maxV = Math.max(...row.map(r=>r.value));
+  const minV = Math.min(...row.map(r=>r.value));
+  const s2 = sum*sum, side2 = side*side;
+  return Math.max((side2*maxV)/s2, s2/(side2*minV));
+}
+
+/* Standard squarified-treemap layout. `items` need only a positive .bytes;
+   returns [{item, x, y, w, h}] filling the given rectangle exactly. */
+function squarify(items, x, y, w, h){
+  const total = items.reduce((s,i)=>s+i.bytes,0);
+  if(total <= 0 || !items.length) return [];
+  const scale = (w*h)/total;
+  let list = items.map(it=>({item:it, value:Math.max(it.bytes*scale, 0.0001)}));
+  const rects = [];
+  let rx=x, ry=y, rw=w, rh=h;
+
+  while(list.length){
+    const side = Math.min(rw, rh);
+    let row = [list[0]];
+    let ratio = worstAspectRatio(row, side);
+    let i = 1;
+    while(i < list.length){
+      const testRow = row.concat([list[i]]);
+      const testRatio = worstAspectRatio(testRow, side);
+      if(testRatio <= ratio){ row = testRow; ratio = testRatio; i++; }
+      else break;
+    }
+    const rowSum = row.reduce((s,r)=>s+r.value,0);
+    const rowLen = rowSum / side;
+    if(rw >= rh){
+      let yy = ry;
+      row.forEach(r=>{ const th=(r.value/rowSum)*rh; rects.push({item:r.item,x:rx,y:yy,w:rowLen,h:th}); yy+=th; });
+      rx += rowLen; rw -= rowLen;
+    } else {
+      let xx = rx;
+      row.forEach(r=>{ const tw=(r.value/rowSum)*rw; rects.push({item:r.item,x:xx,y:ry,w:tw,h:rowLen}); xx+=tw; });
+      ry += rowLen; rh -= rowLen;
+    }
+    list = list.slice(row.length);
+  }
+  return rects;
+}
+
+const TREEMAP_STATE = {};
+const TM_VB_W = 1000, TM_VB_H = 520;
+
+function renderTreemap(letter, node, svgId, crumbId, infoId){
+  const state = TREEMAP_STATE[letter];
+  const container = document.getElementById(svgId);
+  const crumbEl = document.getElementById(crumbId);
+  const infoEl = document.getElementById(infoId);
+
+  crumbEl.innerHTML = state.stack.map((n,i)=>
+    `<button class="tm-crumb" data-idx="${i}">${i===0 ? (letter+':') : escapeHtml(n.name||basename(n.path)||'?')}</button>${i<state.stack.length-1?'<span class="tm-sep">›</span>':''}`
+  ).join('');
+  crumbEl.querySelectorAll('.tm-crumb').forEach(btn=>{
+    btn.onclick = ()=>{
+      const idx = +btn.dataset.idx;
+      if(idx === state.stack.length-1) return;
+      state.stack = state.stack.slice(0, idx+1);
+      renderTreemap(letter, state.stack[state.stack.length-1], svgId, crumbId, infoId);
+    };
+  });
+
+  const items = childrenWithLeftover(node);
+  if(!items.length){
+    container.innerHTML = '<div class="empty">No deeper folders scanned here (scan depth limit, or nothing but loose files).</div>';
+    infoEl.innerHTML = `<b>${escapeHtml(node.name || (letter+':'))}</b> — ${fmt(node.bytes)}`;
+    return;
+  }
+
+  const pad = 2;
+  const rects = squarify(items, pad, pad, TM_VB_W-pad*2, TM_VB_H-pad*2);
+
+  const svgParts = rects.map((r,idx)=>{
+    const it = r.item;
+    const cat = (it.isLeftover || it.isExtra) ? 'other' : categorizeFolderName(it.name);
+    const color = CATS[cat] ? CATS[cat].color : 'var(--cat-other)';
+    const rw = Math.max(r.w-1.4,0), rh = Math.max(r.h-1.4,0);
+    const showLabel = rw>55 && rh>22;
+    const drillable = (it.children && it.children.length) ? true : false;
+    return `
+      <g class="tm-tile" data-idx="${idx}" style="cursor:${drillable?'pointer':'default'}">
+        <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${rw.toFixed(1)}" height="${rh.toFixed(1)}" fill="${color}" fill-opacity="${it.isLeftover?0.4:0.88}" stroke="var(--surface)" stroke-width="1.4" rx="2"></rect>
+        ${showLabel ? `<text x="${(r.x+5).toFixed(1)}" y="${(r.y+15).toFixed(1)}" font-size="11" fill="#fff" style="pointer-events:none;font-family:'Source Sans 3',sans-serif;font-weight:600;">${escapeHtml(truncateLabel(it.name, rw))}</text><text x="${(r.x+5).toFixed(1)}" y="${(r.y+28).toFixed(1)}" font-size="10" fill="#fff" fill-opacity="0.85" style="pointer-events:none;font-family:'IBM Plex Mono',monospace;">${fmt(it.bytes)}</text>` : ''}
+        <title>${escapeHtml(it.name)} — ${fmt(it.bytes)} (${pct(it.bytes,node.bytes).toFixed(1)}% of ${escapeHtml(node.name||letter+':')})</title>
+      </g>`;
+  }).join('');
+
+  container.innerHTML = `<svg viewBox="0 0 ${TM_VB_W} ${TM_VB_H}">${svgParts}</svg>`;
+
+  container.querySelectorAll('.tm-tile').forEach((el, idx)=>{
+    const it = rects[idx].item;
+    el.addEventListener('mouseenter', ()=>{
+      infoEl.innerHTML = `<b>${escapeHtml(it.name)}</b> — ${fmt(it.bytes)} <span style="color:var(--text-faint)">(${pct(it.bytes,node.bytes).toFixed(1)}% of ${escapeHtml(node.name||letter+':')})</span>${it.path?` <span class="mono" style="font-size:11px;">${escapeHtml(it.path)}</span>`:''}`;
+    });
+    el.addEventListener('click', ()=>{
+      if(it.children && it.children.length){
+        const target = it.isExtra ? {name:it.name, path:null, bytes:it.bytes, children:it.children} : it;
+        state.stack.push(target);
+        renderTreemap(letter, target, svgId, crumbId, infoId);
+      }
+    });
+  });
+
+  infoEl.innerHTML = `<b>${escapeHtml(node.name || (letter+':'))}</b> — ${fmt(node.bytes)} total`;
 }
 
 /* ---------------- opportunity detectors ---------------- */
@@ -391,6 +566,14 @@ drives.forEach((d,i)=>{
   panel.className='tabpanel'+(i===0?' active':'');
   panel.id='panel-'+d.letter;
   panel.innerHTML = `
+    <div class="panel-box tm-box">
+      <div class="tm-head">
+        <h4 style="margin:0;">Treemap — click a folder to drill in</h4>
+        <div class="tm-crumbs" id="tmCrumbs-${d.letter}"></div>
+      </div>
+      <div class="tm-svg-wrap" id="tmSvg-${d.letter}"></div>
+      <div class="tm-info" id="tmInfo-${d.letter}"></div>
+    </div>
     <div class="detail-grid">
       <div class="panel-box">
         <h4>Largest folders</h4>
@@ -417,6 +600,12 @@ drives.forEach((d,i)=>{
     </div>
   `;
   panels.appendChild(panel);
+
+  const treeRoot = buildTree(d.scan);
+  if(treeRoot){
+    TREEMAP_STATE[d.letter] = {stack:[treeRoot]};
+    renderTreemap(d.letter, treeRoot, 'tmSvg-'+d.letter, 'tmCrumbs-'+d.letter, 'tmInfo-'+d.letter);
+  }
 });
 
 document.getElementById('footerNote').textContent = drives.length

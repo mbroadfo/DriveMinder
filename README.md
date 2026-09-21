@@ -67,11 +67,16 @@ drilled into one level deeper rather than left as one big blob — see
 
 ## Known limitations
 
-- **MAX_PATH**: Windows PowerShell 5.1's file APIs hit the classic 260-character
-  path limit on some deeply nested folders (common inside old backup sets).
-  Affected subtrees are recorded in `SkippedSample` rather than silently
-  mis-measured, but this means very deep paths can undercount a drive's true
-  usage. Long-path-aware enumeration is on the roadmap.
+- **Permission-restricted folders** (e.g. `Access is denied` on a folder with
+  ACLs from another user profile or backup tool) are recorded in
+  `SkippedSample` with the actual exception, rather than silently
+  mis-measured. There's no safe generic fix for this — DriveMinder reports
+  what it can't read rather than guessing, so a drive's true usage can be
+  undercounted when this happens on a large subtree.
+- **Long paths**: fixed as of v0.2.0 — every path goes through the `\\?\`
+  extended-length prefix, so the classic 260-character MAX_PATH limit no
+  longer causes silent gaps. (Validated against a real ~260-character path
+  that failed before the fix and succeeds after it.)
 - **Duplicate detection is name+size only** — a real feature needs content
   hashing (see roadmap).
 - Windows-only. The scan relies on drive letters, `Win32_LogicalDisk`, and
@@ -79,6 +84,12 @@ drilled into one level deeper rather than left as one big blob — see
 
 ## Roadmap
 
+- [x] Long-path-safe scanning (`\\?\` prefix) — v0.2.0
+- [x] Treemap visualization with click-to-drill — v0.2.0
+- [x] Live console progress while scanning (files/bytes/current folder) — v0.2.0
+- [ ] Extension-colored treemap tiles with legend-linked highlighting
+      (the WinDirStat-style "click `.mp3` in the legend, every mp3 block
+      lights up" interaction — needs file-level, not folder-level, tiles)
 - [ ] Real duplicate-file detection (content hashing, not just name+size)
 - [ ] Backup retention strategy — suggest what to keep/prune across
       generations of backups (e.g. the Quicken `.qdf-backup` pattern, nested
@@ -87,7 +98,6 @@ drilled into one level deeper rather than left as one big blob — see
       the report instead of only seeing the top N
 - [ ] Chat interface to ask questions about a scan ("what's using space on
       D: that I haven't touched since 2020?")
-- [ ] Long-path-safe scanning (`\\?\` prefix)
 - [ ] Optional actual cleanup actions, gated behind explicit per-item confirmation
 
 ## Privacy
