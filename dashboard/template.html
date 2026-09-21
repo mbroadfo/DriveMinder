@@ -47,6 +47,7 @@ h1,h2,h3{font-family:'Big Shoulders Display',system-ui,sans-serif; margin:0; tex
 .mono{font-family:'IBM Plex Mono',ui-monospace,monospace; font-variant-numeric:tabular-nums;}
 header{display:flex; flex-direction:column; gap:6px;}
 header h1{font-size:clamp(28px,5vw,38px); font-weight:800;}
+#liveIndicator .badge{vertical-align:middle; margin-left:8px; font-size:13px; padding:4px 11px;}
 header p{color:var(--text-dim); max-width:65ch; margin:0;}
 .stat-strip{display:flex; flex-wrap:wrap; gap:10px; margin-top:10px;}
 .stat-pill{background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:10px 14px; display:flex; flex-direction:column; gap:2px; min-width:130px;}
@@ -122,7 +123,7 @@ footer{color:var(--text-faint); font-size:12px; border-top:1px solid var(--borde
 
 <div class="wrap">
   <header>
-    <h1>DriveMinder</h1>
+    <h1>DriveMinder <span id="liveIndicator"></span></h1>
     <p id="subhead">A byte-level survey of this PC's drives — what's OS, personal data, backup, or just sitting there.</p>
     <div class="stat-strip" id="statStrip"></div>
   </header>
@@ -322,8 +323,37 @@ function squarify(items, x, y, w, h){
   return rects;
 }
 
-const TREEMAP_STATE = {};
+const TREEMAP_STATE = {}; // letter -> {stack:[nodeObj,...], pathStack:[path|null,...]}
 const TM_VB_W = 1000, TM_VB_H = 520;
+
+/* A live poll rebuilds the whole tree from scratch each time (fresh JSON in,
+   fresh node objects out) - the OLD stack's object references point at a
+   now-discarded tree, so drilling into a folder would otherwise snap back to
+   the root on every single poll. This walks the previous drill-path's PATHS
+   (not object refs) against the NEW tree and stops at the deepest folder
+   that still resolves, so watching a folder fill in live doesn't fight the
+   user's own navigation. */
+function resolveTreemapStack(root, pathStack){
+  const stack = [root];
+  for(let i=1; i<(pathStack||[]).length; i++){
+    const wantPath = pathStack[i];
+    if(wantPath == null) break; // was a synthetic "+N more"/leftover tile - can't survive a refetch
+    const kid = (stack[stack.length-1].children||[]).find(c => c.path === wantPath);
+    if(!kid) break;
+    stack.push(kid);
+  }
+  return stack;
+}
+
+/* Call this whenever a drive gets a FRESH tree (initial render, or a live
+   poll) - as opposed to renderTreemap, which clicks/breadcrumbs call
+   directly since their node objects are already current. */
+function refreshTreemap(letter, root, svgId, crumbId, infoId){
+  const prevPathStack = (TREEMAP_STATE[letter] && TREEMAP_STATE[letter].pathStack) || [root.path];
+  const stack = resolveTreemapStack(root, prevPathStack);
+  TREEMAP_STATE[letter] = { stack, pathStack: stack.map(n=>n.path) };
+  renderTreemap(letter, stack[stack.length-1], svgId, crumbId, infoId);
+}
 
 function renderTreemap(letter, node, svgId, crumbId, infoId){
   const state = TREEMAP_STATE[letter];
@@ -339,6 +369,7 @@ function renderTreemap(letter, node, svgId, crumbId, infoId){
       const idx = +btn.dataset.idx;
       if(idx === state.stack.length-1) return;
       state.stack = state.stack.slice(0, idx+1);
+      state.pathStack = state.pathStack.slice(0, idx+1);
       renderTreemap(letter, state.stack[state.stack.length-1], svgId, crumbId, infoId);
     };
   });
@@ -379,6 +410,7 @@ function renderTreemap(letter, node, svgId, crumbId, infoId){
       if(it.children && it.children.length){
         const target = it.isExtra ? {name:it.name, path:null, bytes:it.bytes, children:it.children} : it;
         state.stack.push(target);
+        state.pathStack.push(target.path != null ? target.path : null);
         renderTreemap(letter, target, svgId, crumbId, infoId);
       }
     });
@@ -473,142 +505,198 @@ function detectOpportunities(drives){
   return cards;
 }
 
-/* ================= RENDER ================= */
-const drives = PAYLOAD.drives || [];
-const totalCapacity = drives.reduce((s,d)=>s+(d.totalBytes||0),0);
-const totalFree = drives.reduce((s,d)=>s+(d.freeBytes||0),0);
-const totalScanned = drives.reduce((s,d)=>s+(d.scan?.TotalBytes||0),0);
+/* ================= RENDER =================
+   renderAll() is called once for the final static report (real data
+   injected at generation time) OR repeatedly for the live scan view
+   (freshly fetched from /live-data every ~1.5s). Same function either way -
+   that's what keeps the live view and the finished report from drifting
+   out of sync with each other. */
+let activeDriveLetter = null;
+let lastPayload = PAYLOAD;
 
-document.getElementById('subhead').textContent =
-  `A byte-level survey of ${drives.length} drive(s) on ${PAYLOAD.machine||'this PC'} — what's OS, personal data, backup, or just sitting there.`;
+function renderAll(payload){
+  const drives = payload.drives || [];
+  const totalCapacity = drives.reduce((s,d)=>s+(d.totalBytes||0),0);
+  const totalFree = drives.reduce((s,d)=>s+(d.freeBytes||0),0);
+  const totalScanned = drives.reduce((s,d)=>s+(d.scan?.TotalBytes||0),0);
+  const finishedDrives = drives.filter(d => d.scan && d.scan.Done);
+  const allDone = drives.length>0 && finishedDrives.length === drives.length;
 
-document.getElementById('statStrip').innerHTML = drives.length ? `
-  <div class="stat-pill"><div class="n">${fmt(totalCapacity)}</div><div class="l">Total capacity</div></div>
-  <div class="stat-pill"><div class="n">${fmt(totalCapacity-totalFree)}</div><div class="l">Used (all drives)</div></div>
-  <div class="stat-pill"><div class="n">${fmt(totalFree)}</div><div class="l">Free</div></div>
-  <div class="stat-pill"><div class="n">${fmt(totalScanned)}</div><div class="l">Bytes accounted for</div></div>
-` : '';
+  document.getElementById('subhead').textContent =
+    `A byte-level survey of ${drives.length} drive(s) on ${payload.machine||'this PC'} — what's OS, personal data, backup, or just sitting there.`;
+  document.getElementById('liveIndicator').innerHTML =
+    (drives.length && !allDone) ? '<span class="badge warn">Scanning…</span>' : '';
 
-const driveGrid = document.getElementById('driveGrid');
-if(!drives.length){
-  driveGrid.innerHTML = '<div class="empty">No scan data embedded in this template. Run scripts\\Invoke-DriveCensus.ps1 to generate a real report.</div>';
-} else {
-  drives.forEach(d=>{
-    const usedBytes = (d.totalBytes||0) - (d.freeBytes||0);
-    const usedPct = pct(usedBytes, d.totalBytes);
-    const freePct = pct(d.freeBytes, d.totalBytes);
-    let badge = '';
-    if(freePct < 10) badge = '<span class="badge crit">Low space</span>';
-    else if(freePct < 20) badge = '<span class="badge warn">Watch</span>';
+  document.getElementById('statStrip').innerHTML = drives.length ? `
+    <div class="stat-pill"><div class="n">${fmt(totalCapacity)}</div><div class="l">Total capacity</div></div>
+    <div class="stat-pill"><div class="n">${fmt(totalCapacity-totalFree)}</div><div class="l">Used (all drives)</div></div>
+    <div class="stat-pill"><div class="n">${fmt(totalFree)}</div><div class="l">Free</div></div>
+    <div class="stat-pill"><div class="n">${fmt(totalScanned)}</div><div class="l">${allDone?'Bytes accounted for':'Bytes scanned so far'}</div></div>
+  ` : '';
 
-    const breakdown = buildFolderBreakdown(d.scan, d.scan.TotalBytes);
-    const catTotals = {};
-    breakdown.forEach(b=>{ catTotals[b.cat] = (catTotals[b.cat]||0) + b.bytes; });
-    const catBarHtml = Object.entries(catTotals).sort((a,b)=>b[1]-a[1]).map(([cat,bytes])=>{
-      const w = pct(bytes, d.scan.TotalBytes);
-      return `<span style="width:${w}%;background:${CATS[cat].color}" title="${CATS[cat].label}: ${fmt(bytes)}"></span>`;
-    }).join('');
+  const driveGrid = document.getElementById('driveGrid');
+  driveGrid.innerHTML = '';
+  if(!drives.length){
+    driveGrid.innerHTML = '<div class="empty">Waiting for the first scan results… (run scripts\\Invoke-DriveCensus.ps1 if you\'re seeing this outside of a live scan)</div>';
+  } else {
+    drives.forEach(d=>{
+      const usedBytes = (d.totalBytes||0) - (d.freeBytes||0);
+      const usedPct = pct(usedBytes, d.totalBytes);
+      const freePct = pct(d.freeBytes, d.totalBytes);
+      const scanning = !(d.scan && d.scan.Done);
+      let badge = scanning ? '<span class="badge warn">Scanning…</span>' : '';
+      if(!scanning && freePct < 10) badge = '<span class="badge crit">Low space</span>';
+      else if(!scanning && freePct < 20) badge = '<span class="badge warn">Watch</span>';
 
-    const card = document.createElement('div');
-    card.className='drive-card';
-    card.innerHTML = `
-      <div class="dtop">
-        <div><span class="dletter">${d.letter}:</span> <span class="dname">${d.label||''}</span></div>
-        ${badge}
+      const breakdown = buildFolderBreakdown(d.scan, d.scan.TotalBytes || 1);
+      const catTotals = {};
+      breakdown.forEach(b=>{ catTotals[b.cat] = (catTotals[b.cat]||0) + b.bytes; });
+      const catBarHtml = Object.entries(catTotals).sort((a,b)=>b[1]-a[1]).map(([cat,bytes])=>{
+        const w = pct(bytes, d.scan.TotalBytes || 1);
+        return `<span style="width:${w}%;background:${CATS[cat].color}" title="${CATS[cat].label}: ${fmt(bytes)}"></span>`;
+      }).join('');
+
+      const card = document.createElement('div');
+      card.className='drive-card';
+      card.innerHTML = `
+        <div class="dtop">
+          <div><span class="dletter">${d.letter}:</span> <span class="dname">${d.label||''}</span></div>
+          ${badge}
+        </div>
+        <div class="cap-bar"><div class="cap-fill" style="width:${usedPct}%"></div></div>
+        <div class="figs"><span><b>${fmt(usedBytes)}</b> used</span><span>${fmt(d.freeBytes)} free</span><span>${fmt(d.totalBytes)}</span></div>
+        <div class="cat-bar">${catBarHtml}</div>
+      `;
+      driveGrid.appendChild(card);
+    });
+  }
+
+  document.getElementById('catLegend').innerHTML = Object.values(CATS).map(c=>
+    `<span class="li"><span class="sw" style="background:${c.color}"></span>${c.label}</span>`
+  ).join('');
+
+  /* cleanup opportunities - only meaningful per-drive once THAT drive is
+     done (TopFiles/TopExtensions/SkippedCount are empty placeholders while
+     scanning, so running the heuristics early would misleadingly look like
+     "all clear"). Drives that finish early still surface their findings
+     right away rather than waiting on slower drives. */
+  const cleanGrid = document.getElementById('cleanGrid');
+  const stillScanning = drives.length - finishedDrives.length;
+  if(!drives.length){
+    cleanGrid.innerHTML = '<div class="empty">No scan data to analyze yet.</div>';
+  } else if(!finishedDrives.length){
+    cleanGrid.innerHTML = '<div class="empty">Finishing the first drive — cleanup suggestions need a completed scan.</div>';
+  } else {
+    const cleanups = detectOpportunities(finishedDrives);
+    const order = {caution:0, review:1, safe:2};
+    cleanups.sort((a,b)=>order[a.tag]-order[b.tag]);
+    let html = cleanups.length ? cleanups.map(c=>`
+      <div class="clean-card tag-${c.tag}">
+        <div class="chead"><h3>${c.title}</h3><span class="amt">${c.amt}</span></div>
+        <div><span class="badge ${c.tag==='safe'?'good':c.tag==='review'?'warn':'crit'}">${c.tag}</span> <span style="color:var(--text-faint);font-size:12px;margin-left:6px;">${c.drives}</span></div>
+        <p>${c.text}</p>
+        <div class="paths">${c.paths.map(p=>`<code>${p}</code>`).join('')}</div>
       </div>
-      <div class="cap-bar"><div class="cap-fill" style="width:${usedPct}%"></div></div>
-      <div class="figs"><span><b>${fmt(usedBytes)}</b> used</span><span>${fmt(d.freeBytes)} free</span><span>${fmt(d.totalBytes)}</span></div>
-      <div class="cat-bar">${catBarHtml}</div>
+    `).join('') : '<div class="empty">Nothing flagged so far.</div>';
+    if(stillScanning>0){
+      html += `<div class="empty" style="grid-column:1/-1;">+ ${stillScanning} drive(s) still scanning — more suggestions may appear once they finish.</div>`;
+    }
+    cleanGrid.innerHTML = html;
+  }
+
+  /* tabs - rebuild each pass, but keep whichever one the user had open */
+  if(!drives.some(d=>d.letter===activeDriveLetter)) activeDriveLetter = drives[0] ? drives[0].letter : null;
+
+  const tabbar = document.getElementById('tabbar');
+  const panels = document.getElementById('tabpanels');
+  tabbar.innerHTML = '';
+  panels.innerHTML = '';
+
+  drives.forEach(d=>{
+    const isActive = d.letter === activeDriveLetter;
+    const scanning = !(d.scan && d.scan.Done);
+    const btn = document.createElement('button');
+    btn.className = 'tabbtn'+(isActive?' active':'');
+    btn.textContent = d.letter+':  '+(d.label||'')+(scanning?' •':'');
+    btn.onclick = ()=>{ activeDriveLetter = d.letter; renderAll(lastPayload); };
+    tabbar.appendChild(btn);
+
+    const breakdown = buildFolderBreakdown(d.scan, d.scan.TotalBytes || 1).slice(0,12);
+    const maxFolder = Math.max(1, ...breakdown.map(f=>f.bytes));
+    const exts = (d.scan.TopExtensions||[]).slice(0,8);
+    const maxExt = Math.max(1, ...exts.map(f=>f.Bytes));
+    const files = (d.scan.TopFiles||[]).slice(0,10);
+
+    const panel = document.createElement('div');
+    panel.className = 'tabpanel'+(isActive?' active':'');
+    panel.id = 'panel-'+d.letter;
+    panel.innerHTML = `
+      <div class="panel-box tm-box">
+        <div class="tm-head">
+          <h4 style="margin:0;">Treemap — click a folder to drill in${scanning?' <span style="color:var(--text-faint);font-weight:400;">(filling in live…)</span>':''}</h4>
+          <div class="tm-crumbs" id="tmCrumbs-${d.letter}"></div>
+        </div>
+        <div class="tm-svg-wrap" id="tmSvg-${d.letter}"></div>
+        <div class="tm-info" id="tmInfo-${d.letter}"></div>
+      </div>
+      <div class="detail-grid">
+        <div class="panel-box">
+          <h4>Largest folders</h4>
+          ${breakdown.length ? breakdown.map(f=>`
+            <div class="barrow">
+              <span class="lbl" title="${f.label}">${f.label}</span><span class="val">${fmt(f.bytes)}</span>
+              <div class="track"><i style="width:${pct(f.bytes,maxFolder)}%;background:${CATS[f.cat].color}"></i></div>
+            </div>`).join('') : '<div class="empty">Nothing scanned here yet.</div>'}
+          <h4 style="margin-top:20px;">Top file types</h4>
+          ${exts.length ? exts.map(f=>`
+            <div class="barrow">
+              <span class="lbl" title="${f.Ext}">${f.Ext} <span style="color:var(--text-faint)">(${f.Count.toLocaleString()})</span></span><span class="val">${fmt(f.Bytes)}</span>
+              <div class="track"><i style="width:${pct(f.Bytes,maxExt)}%"></i></div>
+            </div>`).join('') : '<div class="empty">Available once this drive finishes.</div>'}
+        </div>
+        <div class="panel-box">
+          <h4>Largest individual files</h4>
+          <div class="tablewrap"><table>
+            <thead><tr><th>Path</th><th>Size</th><th>Modified</th></tr></thead>
+            <tbody>${files.length ? files.map(f=>`<tr><td class="p">${f.Path}</td><td class="s">${fmt(f.Bytes)}</td><td class="s">${new Date(f.LastWrite).getFullYear()}</td></tr>`).join('') : `<tr><td class="p empty" colspan="3">Available once this drive finishes.</td></tr>`}</tbody>
+          </table></div>
+          <div class="note">${!scanning ? `${d.scan.SkippedCount||0} item(s) couldn't be read (permissions or path-length limits) and are excluded from these totals.` : `Still scanning — ${(d.scan.ElapsedSec||0).toFixed(0)}s elapsed, ${fmt(d.scan.TotalBytes)} so far.`}</div>
+        </div>
+      </div>
     `;
-    driveGrid.appendChild(card);
+    panels.appendChild(panel);
+
+    const treeRoot = buildTree(d.scan);
+    if(treeRoot){
+      refreshTreemap(d.letter, treeRoot, 'tmSvg-'+d.letter, 'tmCrumbs-'+d.letter, 'tmInfo-'+d.letter);
+    } else {
+      document.getElementById('tmSvg-'+d.letter).innerHTML = '<div class="empty">Starting scan…</div>';
+    }
   });
+
+  document.getElementById('footerNote').textContent = drives.length
+    ? `${allDone ? 'Scanned' : 'Scan started'} ${new Date(payload.generatedAt).toLocaleString()} on ${payload.machine}. Categorization and cleanup suggestions are heuristic (path/name pattern matching) — always verify before deleting anything.`
+    : 'This is the DriveMinder template with no data. Run scripts\\Invoke-DriveCensus.ps1 to generate a real report.';
 }
 
-document.getElementById('catLegend').innerHTML = Object.values(CATS).map(c=>
-  `<span class="li"><span class="sw" style="background:${c.color}"></span>${c.label}</span>`
-).join('');
+renderAll(PAYLOAD);
 
-/* cleanup opportunities */
-const cleanups = drives.length ? detectOpportunities(drives) : [];
-const order = {caution:0, review:1, safe:2};
-cleanups.sort((a,b)=>order[a.tag]-order[b.tag]);
-document.getElementById('cleanGrid').innerHTML = cleanups.length ? cleanups.map(c=>`
-  <div class="clean-card tag-${c.tag}">
-    <div class="chead"><h3>${c.title}</h3><span class="amt">${c.amt}</span></div>
-    <div><span class="badge ${c.tag==='safe'?'good':c.tag==='review'?'warn':'crit'}">${c.tag}</span> <span style="color:var(--text-faint);font-size:12px;margin-left:6px;">${c.drives}</span></div>
-    <p>${c.text}</p>
-    <div class="paths">${c.paths.map(p=>`<code>${p}</code>`).join('')}</div>
-  </div>
-`).join('') : '<div class="empty">No scan data to analyze yet.</div>';
-
-/* tabs */
-const tabbar = document.getElementById('tabbar');
-const panels = document.getElementById('tabpanels');
-drives.forEach((d,i)=>{
-  const btn = document.createElement('button');
-  btn.className='tabbtn'+(i===0?' active':'');
-  btn.textContent = d.letter+':  '+(d.label||'');
-  btn.onclick = ()=>{
-    document.querySelectorAll('.tabbtn').forEach(b=>b.classList.remove('active'));
-    document.querySelectorAll('.tabpanel').forEach(p=>p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('panel-'+d.letter).classList.add('active');
-  };
-  tabbar.appendChild(btn);
-
-  const breakdown = buildFolderBreakdown(d.scan, d.scan.TotalBytes).slice(0,12);
-  const maxFolder = Math.max(1, ...breakdown.map(f=>f.bytes));
-  const exts = (d.scan.TopExtensions||[]).slice(0,8);
-  const maxExt = Math.max(1, ...exts.map(f=>f.Bytes));
-  const files = (d.scan.TopFiles||[]).slice(0,10);
-
-  const panel = document.createElement('div');
-  panel.className='tabpanel'+(i===0?' active':'');
-  panel.id='panel-'+d.letter;
-  panel.innerHTML = `
-    <div class="panel-box tm-box">
-      <div class="tm-head">
-        <h4 style="margin:0;">Treemap — click a folder to drill in</h4>
-        <div class="tm-crumbs" id="tmCrumbs-${d.letter}"></div>
-      </div>
-      <div class="tm-svg-wrap" id="tmSvg-${d.letter}"></div>
-      <div class="tm-info" id="tmInfo-${d.letter}"></div>
-    </div>
-    <div class="detail-grid">
-      <div class="panel-box">
-        <h4>Largest folders</h4>
-        ${breakdown.map(f=>`
-          <div class="barrow">
-            <span class="lbl" title="${f.label}">${f.label}</span><span class="val">${fmt(f.bytes)}</span>
-            <div class="track"><i style="width:${pct(f.bytes,maxFolder)}%;background:${CATS[f.cat].color}"></i></div>
-          </div>`).join('')}
-        <h4 style="margin-top:20px;">Top file types</h4>
-        ${exts.map(f=>`
-          <div class="barrow">
-            <span class="lbl" title="${f.Ext}">${f.Ext} <span style="color:var(--text-faint)">(${f.Count.toLocaleString()})</span></span><span class="val">${fmt(f.Bytes)}</span>
-            <div class="track"><i style="width:${pct(f.Bytes,maxExt)}%"></i></div>
-          </div>`).join('')}
-      </div>
-      <div class="panel-box">
-        <h4>Largest individual files</h4>
-        <div class="tablewrap"><table>
-          <thead><tr><th>Path</th><th>Size</th><th>Modified</th></tr></thead>
-          <tbody>${files.map(f=>`<tr><td class="p">${f.Path}</td><td class="s">${fmt(f.Bytes)}</td><td class="s">${new Date(f.LastWrite).getFullYear()}</td></tr>`).join('')}</tbody>
-        </table></div>
-        <div class="note">${d.scan.SkippedCount||0} item(s) couldn't be read (permissions or path-length limits) and are excluded from these totals.</div>
-      </div>
-    </div>
-  `;
-  panels.appendChild(panel);
-
-  const treeRoot = buildTree(d.scan);
-  if(treeRoot){
-    TREEMAP_STATE[d.letter] = {stack:[treeRoot]};
-    renderTreemap(d.letter, treeRoot, 'tmSvg-'+d.letter, 'tmCrumbs-'+d.letter, 'tmInfo-'+d.letter);
-  }
-});
-
-document.getElementById('footerNote').textContent = drives.length
-  ? `Scanned ${new Date(PAYLOAD.generatedAt).toLocaleString()} on ${PAYLOAD.machine}. Categorization and cleanup suggestions are heuristic (path/name pattern matching) — always verify before deleting anything.`
-  : 'This is the DriveMinder template with no data. Run scripts\\Invoke-DriveCensus.ps1 to generate a real report.';
+/* Live mode: the static final report always has real drives injected, so
+   this only activates when served fresh by Invoke-DriveCensus.ps1's local
+   HTTP server (whose index page keeps the template's empty sample default). */
+if(!PAYLOAD.drives || !PAYLOAD.drives.length){
+  const pollTimer = setInterval(async ()=>{
+    try {
+      const res = await fetch('/live-data', {cache:'no-store'});
+      if(!res.ok) throw new Error('live-data request failed');
+      const fresh = await res.json();
+      lastPayload = fresh;
+      renderAll(fresh);
+      const allDone = fresh.drives && fresh.drives.length>0 && fresh.drives.every(d=>d.scan && d.scan.Done);
+      if(allDone) clearInterval(pollTimer);
+    } catch(e){
+      clearInterval(pollTimer); // server gone (scan script exited) or unreachable - stop trying
+    }
+  }, 1500);
+}
 </script>

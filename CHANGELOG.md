@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.3.0 — Live browser view while scanning (2026-09-21)
+
+- **Live scanning view**: `Invoke-DriveCensus.ps1` now starts a small local
+  HTTP server (`System.Net.HttpListener`) the moment scanning begins and
+  opens the browser immediately, instead of only after everything finishes.
+  The page polls a `/live-data` endpoint every ~1.5s and re-renders with the
+  exact same `renderAll()`/treemap code the finished report uses - not a
+  separate "preview" implementation that could drift out of sync.
+  `Scan-Drive.ps1` gained `-LiveTree`, which tracks a running per-folder
+  size (not just completed subtrees) so top-level folders visibly fill in
+  during the scan instead of staying blank until their whole subtree
+  finishes.
+- **Treemap state survives live refreshes**: drilling into a folder while
+  the view is still polling doesn't reset to the root every ~1.5s - the
+  drill path is re-resolved by folder path against each freshly-fetched
+  tree (falling back gracefully if a folder genuinely disappears). Validated
+  with a standalone Node test covering the refresh-survives, refresh-updates,
+  path-vanishes, and partial-survival cases.
+- **Real performance regression found and fixed during validation**: the
+  first working version of live per-folder tracking - updating every open
+  ancestor folder on every single file - measured ~1.9x slower on a real
+  887GB/370K-file drive (millions of extra PowerShell-level hashtable
+  operations add up; PowerShell's per-operation overhead is much higher than
+  compiled .NET). Fixed by moving that work off the per-file hot path
+  entirely: bytes accumulate in a plain counter and only get distributed to
+  the live tree at each ~1.5s flush instead of on every file. Also made the
+  whole live-tree feature opt-in (`-LiveTree`) so headless/`-NoOpen` runs -
+  where nothing is watching anyway - pay none of this cost.
+- **Real bug found and fixed during validation**: `$liveTreeArg = if (cond)
+  { @('-LiveTree') } else { @() }` hit PowerShell's single-element-array
+  unrolling gotcha - an array returned from inside an if/else expression
+  gets flattened to its bare scalar element on assignment. That silently
+  turned `-LiveTree` into a plain string, which broke `@extraArgs` splatting
+  and crashed every scan job instantly (caught via diagnostic logging that
+  printed the runtime type actually received: `System.String`, not an
+  array). Every live-view run failed before this fix; multiple isolated
+  reproductions of the "same" logic succeeded because they built the array
+  via direct assignment rather than through an if/else expression - the
+  isolation was accidentally avoiding the exact construct that broke.
+
 ## 0.2.0 — Long-path fix + treemap (2026-09-21)
 
 - **Long-path scanning fix**: every path now goes through the `\\?\`

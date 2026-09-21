@@ -20,8 +20,11 @@ cd scripts
 .\Invoke-DriveCensus.ps1
 ```
 
-This scans every local fixed/removable drive in parallel, writes results to
-`output\<timestamp>\`, and opens `DriveMinder-Report.html` in your browser.
+This scans every local fixed/removable drive in parallel, opens a **live view**
+in your browser that fills in while scanning runs (the same treemap you'll get
+in the final report, just fed by a poll endpoint instead of a finished file),
+then writes the finished `DriveMinder-Report.html` to `output\<timestamp>\`
+once everything's done.
 
 Options:
 
@@ -29,7 +32,7 @@ Options:
 # Scan specific drives only
 .\Invoke-DriveCensus.ps1 -DriveLetters C,D
 
-# Don't auto-open the report
+# Don't open a browser at all - headless/scripted use, console progress only
 .\Invoke-DriveCensus.ps1 -NoOpen
 ```
 
@@ -38,14 +41,47 @@ Options:
 - **`scripts/Scan-Drive.ps1`** — single-pass recursive scanner for one drive.
   Uses raw .NET file enumeration (not `Get-ChildItem -Recurse`) so it's fast
   enough for multi-terabyte drives. Records folder sizes by depth, top file
-  extensions, and the largest individual files.
+  extensions, and the largest individual files. With `-LiveTree`, also tracks
+  a running per-folder size total (not just completed subtrees) so a live
+  viewer can show top-level folders filling in instead of staying at zero
+  until their entire subtree finishes - opt-in because it costs real time
+  (see "Live scanning" below), so headless/`-NoOpen` runs skip it.
 - **`scripts/Invoke-DriveCensus.ps1`** — orchestrator. Discovers drives, runs
-  `Scan-Drive.ps1` for each one in parallel background jobs, then renders
-  `dashboard/template.html` with the combined results injected as JSON.
+  `Scan-Drive.ps1` for each one in parallel background jobs, starts a small
+  local HTTP server (`System.Net.HttpListener`, built into .NET - no new
+  install) for the live view, then renders `dashboard/template.html` with
+  the final combined results injected as JSON once every drive finishes.
 - **`dashboard/template.html`** — the report itself. All categorization and
   cleanup-opportunity logic lives here, in client-side JS, operating on the
   raw scan JSON. Keeping the "smart" part in one JS file (rather than
-  PowerShell) makes it easy to extend without touching the scanner.
+  PowerShell) makes it easy to extend without touching the scanner. The
+  exact same `renderAll()` function draws both the finished static report
+  (data injected once) and the live view (same function, called every ~1.5s
+  with freshly polled data) - they can't drift apart because they're not
+  two implementations of the same thing, they're one.
+
+### Live scanning
+
+A live view opens automatically (unless `-NoOpen`) and fills in while
+scanning runs, using the same treemap as the finished report - top-level
+folders show real partial totals climbing, not just a blank space until
+their whole subtree finishes. Drilling into a folder survives the view
+refreshing under you (it re-resolves your position by path each poll rather
+than resetting to the root).
+
+This has a real, measured cost: tracking the live per-folder tree was ~1.9x
+slower on a real 887GB/370K-file drive in its naive form, and even after
+moving the expensive part off the per-file hot path (bytes now accumulate in
+a plain counter and only get distributed to the live tree at each ~1.5s
+flush, not on every single file), it's still slower than a plain scan. That
+cost is opt-in: `-LiveTree` is only passed to the scanner when something
+will actually be watching, so `-NoOpen` runs stay at full speed. The
+live-preview totals can be briefly approximate right at the moment scanning
+crosses from one folder into an unrelated one (bytes counted in the gap
+between flushes get credited to whichever folder is active when the flush
+happens) - this only affects what the live view shows in the moment; the
+final report always comes from the exact, unaffected post-order accounting
+that was already there.
 
 ### Categorization
 
@@ -87,6 +123,7 @@ drilled into one level deeper rather than left as one big blob — see
 - [x] Long-path-safe scanning (`\\?\` prefix) — v0.2.0
 - [x] Treemap visualization with click-to-drill — v0.2.0
 - [x] Live console progress while scanning (files/bytes/current folder) — v0.2.0
+- [x] Live browser view (same treemap, filling in while scanning runs) — v0.3.0
 - [ ] Extension-colored treemap tiles with legend-linked highlighting
       (the WinDirStat-style "click `.mp3` in the legend, every mp3 block
       lights up" interaction — needs file-level, not folder-level, tiles)
