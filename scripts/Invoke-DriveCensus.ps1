@@ -10,11 +10,21 @@
 .EXAMPLE
   .\Invoke-DriveCensus.ps1 -DriveLetters C,D -NoOpen
       Scans only C: and D:, writes the report without opening a browser.
+
+.EXAMPLE
+  .\Invoke-DriveCensus.ps1 -DriveLetters D -FullRescan
+      Ignores any existing cache for D: and does a full walk, same as every
+      run did before caching existed. Rebuilds a fresh cache either way.
 #>
 param(
     [string[]]$DriveLetters,
     [string]$OutputDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'output'),
-    [switch]$NoOpen
+    [switch]$NoOpen,
+    # Passed through to each per-drive Scan-Drive.ps1 job - see its own
+    # .NOTES for what the cache does and the one gap it leaves.
+    [string]$CacheDir = (Join-Path (Split-Path -Parent $PSScriptRoot) 'cache'),
+    [switch]$FullRescan,
+    [int64]$MinHashBytes = 1048576
 )
 
 $ErrorActionPreference = 'Stop'
@@ -79,14 +89,19 @@ $progressFiles = @{}
 # (caught by running with diagnostic logging: extraArgs came through typed
 # as System.String, not an array). Building the array via a plain += avoids
 # the unrolling entirely.
-$liveTreeArgs = @()
-if ($wantLiveView) { $liveTreeArgs += '-LiveTree' }
+$extraArgs = @()
+if ($wantLiveView) { $extraArgs += '-LiveTree' }
+$extraArgs += '-CacheDir'
+$extraArgs += $CacheDir
+$extraArgs += '-MinHashBytes'
+$extraArgs += $MinHashBytes
+if ($FullRescan) { $extraArgs += '-FullRescan' }
 
 $jobs = foreach ($d in $DriveLetters) {
     $outJson = Join-Path $runDir "scan_$d.json"
     $progJson = Join-Path $runDir "progress_$d.json"
     $progressFiles[$d] = $progJson
-    Start-Job -Name "scan_$d" -ArgumentList $scanScript, $d, $outJson, $progJson, $liveTreeArgs -ScriptBlock {
+    Start-Job -Name "scan_$d" -ArgumentList $scanScript, $d, $outJson, $progJson, $extraArgs -ScriptBlock {
         param($script, $letter, $out, $prog, $extraArgs)
         & powershell -NoProfile -ExecutionPolicy Bypass -File $script -DriveRoot "$letter`:\" -OutJson $out -ProgressJson $prog @extraArgs
     }
@@ -110,7 +125,11 @@ if ($wantLiveView) {
             # instead of "render this once and stop", so this exact same file
             # doubles as both the live view and (once statically re-rendered
             # by the parent script at the end) the final report.
-            $templateText = Get-Content $templatePath -Raw
+            # Explicit -Encoding UTF8 on every read below: everything this tool
+            # writes is BOM-less UTF-8, and Windows PowerShell's Get-Content
+            # otherwise assumes the ANSI codepage, garbling non-ASCII text
+            # (em dashes in the dashboard, accented folder names in scan data).
+            $templateText = Get-Content $templatePath -Raw -Encoding UTF8
 
             function Get-LiveDrives {
                 $result = @()
@@ -120,12 +139,12 @@ if ($wantLiveView) {
                     $vol = Get-Volume -DriveLetter $d -ErrorAction SilentlyContinue | Select-Object -First 1
                     $scanObj = $null
                     if (Test-Path $outJson) {
-                        try { $scanObj = Get-Content $outJson -Raw | ConvertFrom-Json } catch {}
+                        try { $scanObj = Get-Content $outJson -Raw -Encoding UTF8 | ConvertFrom-Json } catch {}
                         if ($scanObj) { $scanObj | Add-Member -NotePropertyName Done -NotePropertyValue $true -Force }
                     }
                     if (-not $scanObj -and (Test-Path $progJson)) {
                         try {
-                            $p = Get-Content $progJson -Raw | ConvertFrom-Json
+                            $p = Get-Content $progJson -Raw -Encoding UTF8 | ConvertFrom-Json
                             $scanObj = [pscustomobject]@{
                                 DriveRoot     = $p.DriveRoot
                                 TotalBytes    = $p.BytesScanned
@@ -222,13 +241,27 @@ foreach ($d in $DriveLetters) {
     # silently matching more than one volume if $d were ever anything but a
     # single clean letter.
     $vol = Get-Volume -DriveLetter $d -ErrorAction SilentlyContinue | Select-Object -First 1
-    $scanRaw = Get-Content $scanFile -Raw
+    $scanRaw = Get-Content $scanFile -Raw -Encoding UTF8
+    # Scan-Drive.ps1's own output has no Done field - that's only ever added
+    # by the live server's Get-LiveDrives when a poll catches a finished scan.
+    # Without setting it here too, every FINISHED static report rendered
+    # `scanning = true` forever (renderAll checks `d.scan.Done`), showing a
+    # permanent "Scanning..." badge and "still scanning" footer text on a
+    # report that was actually 100% complete - caught by actually opening a
+    # real generated report instead of only reading the template's client
+    # logic, which never surfaced it since it reads correctly in isolation.
+    $scanObj = $scanRaw | ConvertFrom-Json
+    $scanObj | Add-Member -NotePropertyName Done -NotePropertyValue $true -Force
+    if ($scanObj.CacheStats) {
+        $cs = $scanObj.CacheStats
+        Write-Host "  $d`: dirs reused $($cs.DirsReused)/$($cs.DirsTotal), files hashed $($cs.FilesHashed) (walk $($scanObj.WalkElapsedSec)s, hash $($scanObj.HashElapsedSec)s)" -ForegroundColor DarkGray
+    }
     $drives += [pscustomobject]@{
         letter     = $d
         label      = if ($vol) { $vol.FileSystemLabel } else { '' }
         totalBytes = if ($vol) { [int64]$vol.Size } else { $null }
         freeBytes  = if ($vol) { [int64]$vol.SizeRemaining } else { $null }
-        scan       = ($scanRaw | ConvertFrom-Json)   # re-hydrate; re-serialized below alongside metadata
+        scan       = $scanObj
     }
 }
 
@@ -247,7 +280,7 @@ $payloadJson = $payload | ConvertTo-Json -Depth 8 -Compress
 # concatenation - NOT [regex]::Replace with the payload as the replacement
 # string, since .NET regex treats "$" specially there and real folder names
 # in this data legitimately contain "$" (e.g. "$Windows.~WS").
-$template = Get-Content $templatePath -Raw
+$template = Get-Content $templatePath -Raw -Encoding UTF8
 $startTok = '/*__DRIVEMINDER_DATA_START__*/'
 $endTok = '/*__DRIVEMINDER_DATA_END__*/'
 $startIdx = $template.IndexOf($startTok)

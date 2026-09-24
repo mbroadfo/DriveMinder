@@ -550,7 +550,33 @@ function detectOpportunities(drives){
       paths: top.map(f=>`${f.drive}: ${basename(f.path)} — ${fmt(f.bytes)} (${f.year})`)});
   }
 
-  // 4. Possible duplicates: same filename + same size seen more than once
+  // 4. Confirmed duplicates: real content hashes match (Scan-Drive.ps1's
+  // staged size -> partial-hash -> full-hash pipeline, files >= its
+  // -MinHashBytes floor only). Grouping HashedFiles by FullHash across every
+  // drive here mirrors exactly how the name+size fallback below already
+  // works across drives - the only difference is the grouping key.
+  const hashSeen = new Map();
+  drives.forEach(d=>{
+    (d.scan.HashedFiles||[]).forEach(f=>{
+      if(!hashSeen.has(f.FullHash)) hashSeen.set(f.FullHash, []);
+      hashSeen.get(f.FullHash).push({drive:d.letter, path:f.Path, bytes:f.Bytes});
+    });
+  });
+  let hashGroups = [...hashSeen.values()].filter(g=>g.length>1);
+  hashGroups.sort((a,b)=> (b[0].bytes*b.length) - (a[0].bytes*a.length));
+  if(hashGroups.length){
+    const total = hashGroups.reduce((s,g)=>s+g[0].bytes*(g.length-1),0);
+    const involvedDrives = [...new Set(hashGroups.flatMap(g=>g.map(x=>x.drive)))];
+    cards.push({tag:'review', title:'Confirmed duplicates (content hash matches)', amt:'~'+fmt(total)+' reclaimable',
+      drives:involvedDrives.map(d=>d+':').join(', '),
+      text:`${hashGroups.length} file(s) have byte-for-byte identical content elsewhere on the PC, verified by hash - not just a name+size guess. Safe to review and remove all but one copy of each.`,
+      paths: hashGroups.slice(0,8).map(g=>`${basename(g[0].path)} (${fmt(g[0].bytes)}) — on ${g.map(x=>x.drive+':').join(', ')} (${g.length} copies)`)});
+  }
+
+  // 5. Possible duplicates (fallback): same filename + same size, for files
+  // too small to be hash-candidates (below Scan-Drive.ps1's -MinHashBytes)
+  // or not yet covered by a hash pass. Weaker signal than #4 above - kept
+  // as a fallback, not replaced, since it still catches things #4 can't.
   const seen = new Map();
   drives.forEach(d=>{
     (d.scan.TopFiles||[]).forEach(f=>{
@@ -566,11 +592,11 @@ function detectOpportunities(drives){
     const involvedDrives = [...new Set(dupGroups.flatMap(g=>g.map(x=>x.drive)))];
     cards.push({tag:'review', title:'Same filename + size appears more than once', amt:'~'+fmt(total)+' redundant',
       drives:involvedDrives.map(d=>d+':').join(', '),
-      text:`${dupGroups.length} file(s) among the largest on each drive share an identical name and size elsewhere on the PC — a strong hint they're duplicates (name+size only; full hash-based duplicate detection is a planned feature). Verify before deleting.`,
+      text:`${dupGroups.length} file(s) among the largest on each drive share an identical name and size elsewhere on the PC — a weaker, unverified signal than the hash-confirmed card above (name+size only, or too small to be hash-checked). Verify before deleting.`,
       paths: dupGroups.slice(0,8).map(g=>`${basename(g[0].path)} (${fmt(g[0].bytes)}) — on ${g.map(x=>x.drive+':').join(', ')}`)});
   }
 
-  // 5. Backup-tagged volume, just for awareness
+  // 6. Backup-tagged volume, just for awareness
   drives.forEach(d=>{
     const bd = buildFolderBreakdown(d.scan, d.scan.TotalBytes);
     const backupBytes = bd.filter(x=>x.cat==='backup').reduce((s,x)=>s+x.bytes,0);
@@ -580,7 +606,7 @@ function detectOpportunities(drives){
     }
   });
 
-  // 6. Large Downloads folder
+  // 7. Large Downloads folder
   drives.forEach(d=>{
     const dl = (d.scan.Directories||[]).find(x=>x.Depth===1 && /^downloads$/i.test(basename(x.Path)));
     if(dl && dl.Bytes > 10*GiB){

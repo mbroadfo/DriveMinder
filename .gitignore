@@ -1,6 +1,9 @@
 # Scan output contains real personal file paths - never commit it
 output/
 
+# Incremental-scan cache also indexes real file paths - same rationale
+cache/
+
 # OS / editor cruft
 Thumbs.db
 desktop.ini
