@@ -34,14 +34,23 @@ Options:
 
 # Don't open a browser at all - headless/scripted use, console progress only
 .\Invoke-DriveCensus.ps1 -NoOpen
+
+# Ignore the incremental-scan cache and do a full walk of every drive
+.\Invoke-DriveCensus.ps1 -FullRescan
 ```
+
+Every run after the first one is a **refresh**, not a full rebuild - see
+"Incremental refresh + duplicate detection" below.
 
 ## How it works
 
 - **`scripts/Scan-Drive.ps1`** — single-pass recursive scanner for one drive.
   Uses raw .NET file enumeration (not `Get-ChildItem -Recurse`) so it's fast
   enough for multi-terabyte drives. Records folder sizes by depth, top file
-  extensions, and the largest individual files. With `-LiveTree`, also tracks
+  extensions, and the largest individual files. Persists a small per-drive
+  cache so the *next* run can skip re-reading unchanged folders and never
+  re-hashes a file that hasn't changed - see "Incremental refresh + duplicate
+  detection" below. With `-LiveTree`, also tracks
   a running per-folder size total (not just completed subtrees) so a live
   viewer can show top-level folders filling in instead of staying at zero
   until their entire subtree finishes - opt-in because it costs real time
@@ -112,13 +121,50 @@ without clicking down through every container in between. A tile only stops
 recursing - and stays click-to-zoom instead - once it runs out of children
 or its rect gets too small on screen to subdivide legibly.
 
+### Incremental refresh + duplicate detection
+
+Every scan after the first one on a given drive is a **refresh**, not a full
+rebuild. `Scan-Drive.ps1` keeps a small per-drive cache in `cache/` (a folder
+snapshot plus a large-file index) and, on the next run, trusts a directory's
+own file listing from cache instead of re-reading it from disk whenever that
+directory's own modified-time hasn't changed since last time. Recursion never
+stops early on a hit, though — every directory is still visited and checked
+every run, because NTFS only updates a folder's own timestamp for its
+*immediate* entries, never for something changed further down inside a
+child. What a hit skips is specifically the expensive part (re-reading that
+one directory's file listing), not the walk itself. `-FullRescan` ignores
+the cache entirely for a one-off ground-truth pass (still rebuilds a fresh
+cache afterward, so the *next* normal run benefits).
+
+The same cache also makes **real, content-hash-verified duplicate
+detection** cheap enough to run on every scan automatically: any file at
+least 1MB (`-MinHashBytes`) that shares its exact size with another file is
+hashed in stages — a cheap first+last-64KB partial hash first, a full
+SHA-256 only for files that also collide on that — and the result is
+persisted per file, keyed to its size and modified-time, so an unchanged
+file is never rehashed on a later run. This is a real correctness/speed
+upgrade over the older name+size heuristic below: hashes don't care what a
+file is named, and they *prove* two files are identical rather than
+guessing from name and size alone.
+
+**One known gap**: a file edited in place - same name, same size, content
+silently overwritten - inside a directory whose own modified-time doesn't
+change for any other reason can go undetected by a normal refresh (verified
+empirically: most apps write-to-temp-then-rename-over on save, which *does*
+bump the parent folder's timestamp and self-corrects; a raw in-place
+overwrite does not). `-FullRescan` is the manual escape hatch for when that
+matters.
+
 ### Cleanup opportunities (current heuristics)
 
 - Drives running low on free space
 - Windows upgrade leftover folders (`$Windows.~WS`, `Windows.old`)
 - Large files untouched for 2+ years
-- Files with matching name + size found in more than one place (a cheap
-  duplicate signal — see roadmap for real hash-based detection)
+- **Confirmed duplicates** — real content-hash matches (files ≥1MB; see
+  "Incremental refresh + duplicate detection" above)
+- Files with matching name + size found in more than one place (fallback
+  signal for files too small to be hash-checked, or not yet covered by a
+  hash pass)
 - Drives that are mostly backup/archive data (flagged for awareness, not as junk)
 - Oversized Downloads folders
 
@@ -134,8 +180,13 @@ or its rect gets too small on screen to subdivide legibly.
   extended-length prefix, so the classic 260-character MAX_PATH limit no
   longer causes silent gaps. (Validated against a real ~260-character path
   that failed before the fix and succeeds after it.)
-- **Duplicate detection is name+size only** — a real feature needs content
-  hashing (see roadmap).
+- **Duplicate detection is hash-verified only for files ≥1MB** (the
+  `-MinHashBytes` floor) — smaller files still only get the weaker
+  name+size fallback signal, since indexing every tiny file for hashing
+  wouldn't be worth the cache size/cost for space that small anyway.
+- **Incremental refresh has one narrow gap**: a file edited in place without
+  changing its parent folder's own timestamp can go undetected until a
+  `-FullRescan` — see "Incremental refresh + duplicate detection" above.
 - Windows-only. The scan relies on drive letters, `Win32_LogicalDisk`, and
   Windows-specific folder conventions (`AppData`, `Program Files`, etc).
 
@@ -150,12 +201,14 @@ or its rect gets too small on screen to subdivide legibly.
       "Categorization" above)
 - [x] Nested/cushion treemap layout (folders subdivided by their own
       children on the same view, not one level per click) — v0.5.0
+- [x] Incremental refresh (skip re-reading unchanged folders) — v0.6.0
+- [x] Real duplicate-file detection (content hashing, not just name+size,
+      files ≥1MB) — v0.6.0
 - [ ] Click-to-highlight: click `.mp3` in the legend, every mp3-dominant
       tile lights up (needs the coloring above first, which now exists)
 - [ ] File-level treemap tiles (true WinDirStat parity - would need per-file
       data sent to the client, which today's design deliberately avoids for
       report-size/scan-speed reasons)
-- [ ] Real duplicate-file detection (content hashing, not just name+size)
 - [ ] Backup retention strategy — suggest what to keep/prune across
       generations of backups (e.g. the Quicken `.qdf-backup` pattern, nested
       full-drive backup sets)
@@ -167,6 +220,7 @@ or its rect gets too small on screen to subdivide legibly.
 
 ## Privacy
 
-Scan output (`output/`) contains real file paths and folder names from your
-PC and is **git-ignored** — it never gets committed or pushed. Only the tool
-code itself is version-controlled.
+Scan output (`output/`) and the incremental-scan cache (`cache/`) both
+contain real file paths and folder names from your PC and are **git-ignored**
+— neither ever gets committed or pushed. Only the tool code itself is
+version-controlled.

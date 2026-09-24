@@ -1,5 +1,94 @@
 # Changelog
 
+## 0.6.0 — Incremental refresh + hash-verified duplicate detection (2026-09-24)
+
+- **A finished report no longer shows a permanent "Scanning..." badge.**
+  `Invoke-DriveCensus.ps1`'s live-view code path sets `Done: true` on a
+  finished scan (`Get-LiveDrives`), but the code path that builds the
+  *final static report* never did - so every completed report silently
+  rendered `scanning = true` forever (`renderAll()` checks `d.scan.Done`),
+  showing "Scanning..." and "Bytes scanned so far" on a report that was
+  actually 100% done. Caught by actually opening a real generated report in
+  a browser rather than only reading the client logic in isolation, where it
+  reads correctly. Fixed by setting `Done` on the drive object built for the
+  final payload too (`Invoke-DriveCensus.ps1:236`), the same way the live
+  server already does.
+- **Scans are now incremental.** A full scan of a real ~900GB drive with
+  several hundred thousand files took under three minutes - asking "how
+  long did that take" surfaced the obvious follow-up: why redo all of it
+  every time? `Scan-Drive.ps1` now persists a small
+  per-drive cache (`cache/<Letter>_folders.json`, `cache/<Letter>_files.tsv`)
+  and, on a later run, trusts a directory's own file listing from cache
+  instead of re-reading it from disk whenever that directory's own
+  modified-time hasn't changed. A naive version of this - check a folder's
+  mtime once, skip its entire subtree on a match - would have been a real
+  correctness bug: NTFS only updates a directory's own `LastWriteTime` for
+  its *immediate* entries, never for something changed further down inside a
+  child. So recursion never stops early on a hit; every directory is still
+  visited and mtime-checked every run. What a hit skips is specifically the
+  expensive part (`EnumerateFileSystemInfos()` on that one directory), not
+  the walk itself. `-FullRescan` is the manual escape hatch for the one
+  narrow gap this leaves (a file edited in place without changing its parent
+  folder's own timestamp) - empirically confirmed real on this machine (a
+  same-size in-place content edit does not bump the parent directory's
+  `LastWriteTime`) rather than just assumed.
+- **Duplicate detection is now content-hash-verified**, not just a name+size
+  guess. Files ≥1MB (`-MinHashBytes`) that share an exact size are hashed in
+  stages - free size-bucketing (already known from the walk), a cheap
+  first+last-64KB partial hash pre-filter, then a full SHA-256 only for
+  partial-hash survivors - and every computed hash is persisted per file,
+  keyed to its size and modified-time, so an unchanged file is never
+  rehashed on a later run. This is what keeps "hash automatically on every
+  scan" cheap after the first run. The old name+size detector stays as a
+  fallback for files below the hash floor, not replaced.
+- **Real bug found while implementing the cache**: `@(Get-Content $path -Raw
+  | ConvertFrom-Json)` - wrapping a `ConvertFrom-Json` *pipeline expression*
+  (as opposed to an already-assigned variable) in `@()` - silently collapsed
+  a 5-element JSON array into a single-element array containing the whole
+  thing, which broke every cache-hit lookup (`dirsReused` stuck at 0 even on
+  an immediate rerun with zero filesystem changes). A bare assignment from
+  the identical pipeline (`$x = $path | ConvertFrom-Json`) gives the correct
+  flat array; only wrapping the live pipeline itself in `@()` triggers this.
+  Caught by actually running the scanner twice in a row against a synthetic
+  fixture and finding `dirsReused=0/5` on the second run instead of the
+  expected `5/5` - not by reading the code, which looked correct.
+- **Real design flaw found on the first real-drive run, and fixed**: the
+  cache was only written after the hash pass finished. On that same real
+  drive the walk took its usual few minutes, then hashing ran for well over
+  20 minutes with nothing on disk - so killing or crashing a long first run would have
+  thrown away the walk and every hash computed. The folder cache and file
+  index are now written as soon as the walk ends, before hashing starts, and
+  the hash pass rewrites the file index every `-CheckpointSeconds` (default
+  60) so an interrupted run keeps its progress. Writes are atomic
+  (`File.Replace` of a `.tmp` file, not delete-then-move, which would leave
+  a window with no cache at all).
+  Verified by killing a scan mid-hash on a 3,000-file fixture: 490 hashes
+  were already on disk, and the rerun reported `dirsReused=1/1` and hashed
+  only the remaining 2,510.
+- **Second real bug, caught by that same test**: the first version of the
+  atomic swap called `File.Replace($tmp, $dest, $null)`. PowerShell coerces
+  a plain `$null` to `""` for a .NET string parameter, which `Replace`
+  rejects, and the surrounding best-effort `catch` swallowed the error - so
+  the cache silently never updated after the first write. Fixed with
+  `[NullString]::Value`. Only visible because the test checked what was
+  actually on disk mid-run instead of trusting the run to have saved.
+- **Validated**: a synthetic fixture (scratchpad, not the repo) with a true
+  duplicate pair, a same-size/different-content pair, a unique file, and a
+  same-name-and-size pair below the hash floor - run twice back-to-back
+  confirmed `TotalBytes`/`TopExtensions`/`Directories`/`HashedFiles` are
+  byte-identical between the cold and warm run, `dirsReused` went from
+  `0/5` to `5/5`, and `filesHashed` from `2` to `0`. (`TopFiles` is *not*
+  identical between runs on this specific tiny fixture - a known, accepted
+  gap: `TopFiles` reconstruction on a cache hit only recovers files ≥1MB,
+  since that's all the file-index cache stores; on any real multi-hundred-GB
+  drive the true top-300-largest files are always far above that floor, but
+  this fixture is small enough that its two 2KB files were briefly "in the
+  top 300" and dropped out on the cache-hit run.) Separately confirmed:
+  renaming a folder between runs correctly drops its stale cache row and
+  picks up the new name/path with no leftover entries, and `-FullRescan`
+  ignores the cache and correctly re-detects an in-place edit that a normal
+  refresh missed.
+
 ## 0.5.0 — Nested/cushion treemap layout (2026-09-21)
 
 - **The treemap now subdivides recursively (`buildNestedTiles()`) instead of
